@@ -1374,23 +1374,35 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
     defined: set[str] = set(BUILTIN_VARS)
     if design:
         defined |= set(design.injected_vars)
+    external = set(defined)          # 外部传入变量（通话开始就有值）
+    internal: dict[str, str] = {}    # 流程内部变量 -> 产生它的节点名
     for n in nodes:
         nd = n.get("nodeData") or {}
+        nm = n.get("name", "?")
         for r in nd.get("returns") or []:
             if r.get("alias"):
                 defined.add(r["alias"])
+                internal.setdefault(r["alias"], f"{nm} 接口返回")
         for v in nd.get("vars") or []:
             if v.get("name"):
                 defined.add(v["name"])
+                internal.setdefault(v["name"], f"{nm} 变量赋值")
         for e in nd.get("entities") or []:
             if e.get("varName"):
                 defined.add(e["varName"])
+                internal.setdefault(e["varName"], f"{nm} 词槽采集")
         if nd.get("varName"):
             defined.add(nd["varName"])
+            internal.setdefault(nd["varName"], f"{nm} 收号")
     for v in sorted(_clean_var_names(VAR_REF.findall(sp))):
         if v not in defined:
             add("error", "E11", "voiceSettings.systemPrompt",
                 f"引用了未定义的变量 ${{{v}}}；若来自外部注入，请写进「环境配置 - 环境注入变量」")
+        elif v in internal and v not in external:
+            # 通话开始时内部变量还没有值，写进全局提示词会诱导大模型提前编造
+            add("warn", "W10", "voiceSettings.systemPrompt",
+                f"${{{v}}} 是流程内部变量（{internal[v]}），不该出现在全局提示词里；"
+                f"「相关信息」只列外部传入变量，内部变量请挪到产生它之后的节点话术中说明")
     for n in nodes:
         blob = json.dumps(n.get("nodeData") or {}, ensure_ascii=False)
         for v in sorted(_clean_var_names(VAR_REF.findall(blob))):
