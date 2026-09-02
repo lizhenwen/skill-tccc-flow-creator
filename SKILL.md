@@ -106,6 +106,7 @@ $PY <skill>/scripts/tccc_flow.py build 设计稿.md -o 新流程.json --base 导
 | `references/node-schema.md` | 需要确认外部 JSON 字段含义、默认值、枚举时查 |
 | `references/canvas-rules.md` | 排查导入失败/保存被拦时查（含源码出处） |
 | `assets/example-催件查询.md` | 直接照抄的完整示例 |
+| `README.md` | 给人看的说明文档；用户问"这个工具怎么用"时把它指过去 |
 
 ## 已验证
 
