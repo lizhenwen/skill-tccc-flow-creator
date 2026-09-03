@@ -30,17 +30,14 @@
 ## 为什么要有它
 
 画布上手拖节点，一个真实的呼入流程动辄 120+ 节点、300+ 连线，改一句话术要点开十几个弹窗。
-之前的 `tccc-flow-dsl`（TypeScript 链式 API）解决了"批量生成"，但还有三个问题：
+本 skill 用一份 Markdown 设计稿把整个流程管起来，解决四个问题：
 
 | 痛点 | 本 skill 的做法 |
 |---|---|
-| 写 TS 脚本对非开发不友好，AI 生成也容易类型错 | 改成写 **Markdown**，人能读、能评审、能直接 diff |
+| 手工在画布上改节点/连线繁琐，AI 直接生成 JSON 又容易字段错 | 改成写 **Markdown**，人能读、能评审、能直接 diff |
 | 只能从零生成，改不了存量画布 | 支持 `decompile` 反向，且保证可回编译 |
 | 生成的 JSON 导入成功但保存时被画布校验拦住 | 内置**保存期**校验，error 阻断并给出定位 |
-| 依赖 node/tsx 与仓库路径，换机器/移目录就挂 | 纯 Python 标准库，路径无耦合 |
-
-另外顺带修掉了旧 DSL 的两处硬伤：`contentType` 的合法值是 `fix` 而不是 `fixed`；
-`extractVariableNode.vars[].mode` 只有 `llm` / `fix`，没有 `expression`。
+| 依赖复杂运行时（node/tsx 等）与仓库路径，换机器/移目录就挂 | 纯 Python 标准库，路径无耦合 |
 
 ---
 
