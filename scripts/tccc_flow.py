@@ -721,9 +721,111 @@ def _resolve_branch_ids(n: Node, base_node: dict[str, Any] | None) -> None:
         b.bid = claim(b.kind, b.content) or branch_id_of(n.key, i, b.content)
 
 
+# ============================================================================
+# 4.0 节点几何估算（1:1 移植画布 src/flow/utils/manualLayoutNodeSizeEstimate.ts）
+#
+# 画布「一键整理」用的就是这套常量。核心规律：分支区高度 =
+#   24（分支标题+间距） + n × 40（每个分支块） + (n-1) × 12（分支间距）
+# 即**每多一个分支，节点高 +52px**（40 分支块 + 12 间距，正好是 208 的 1/4）。
+# 改画布样式后要回来核对这些常量，否则自动布局会出现视觉重叠。
+# ============================================================================
+
+NODE_W = 260                    # DEFAULT_NODE_WIDTH
+H_DEFAULT = 120                 # DEFAULT_NODE_HEIGHT
+V_PADDING = 24                  # NODE_VERTICAL_PADDING
+LABEL_H = 36                    # LABEL_CONTENT_HEIGHT（图标 24 + 间距 12）
+TITLE_GAP_H = 24                # TITLE_WITH_GAP_HEIGHT（标题 12 + 间距 12）
+WELCOME_H = 108                 # WELCOME_CONTENT_HEIGHT（话术框）
+COMPACT_H = 40                  # COMPACT_CONTENT_HEIGHT
+CONTENT_GAP = 12                # 元素间距
+BRANCH_ITEM_H = 40              # 单个分支块高度
+PARAM_ROW_H = 36                # 接口节点每行参数
+JUDGE_MIN_H = 56                # 条件分支最小高度
+JUDGE_LINE_H = 28               # 条件分支每行
+JUDGE_V_PADDING = 34            # 条件分支上下留白
+GLOBAL_TIPS_H = 46              # 全局节点顶部的「全局」标记条
+API_MIN_H, API_MAX_H = 420, 680
+CHAT_MIN_H = 168
+GLOBAL_CHAT_MIN_H = 214
+HANGUP_H = 48                   # 结束通话节点（画布估算器未覆盖，用真实节点样式高度）
+
+# 布局参数：层距要容得下 260 宽的节点 + 连线弯折空间
+LAYER_GAP, ORIGIN_X, ORIGIN_Y, ROW_GAP = 440, 350, 300, 48
+
+
+def branch_section_height(count: int) -> float:
+    """分支区高度：0 个分支时整块不渲染。"""
+    if count <= 0:
+        return 0
+    return TITLE_GAP_H + count * BRANCH_ITEM_H + (count - 1) * CONTENT_GAP
+
+
+def _judge_branch_height(b: Branch) -> float:
+    if b.kind == "else":
+        return JUDGE_MIN_H
+    lines = max(2, len(b.extra.get("conditions") or []) * 2)
+    return max(JUDGE_MIN_H, JUDGE_V_PADDING + lines * JUDGE_LINE_H)
+
+
+def estimate_node_height(n: Node) -> float:
+    """估算节点渲染高度，口径与画布「一键整理」完全一致。
+
+    注意：分支数按 nodeData.branches 的**全量**计（含 global_intent），
+    与画布估算器保持一致——偏保守，多留空间不会造成重叠。
+    """
+    k = n.kind
+    nb = len(n.branches)
+    tips = GLOBAL_TIPS_H if n.is_global else 0
+
+    if k == "start":
+        return H_DEFAULT
+    if k == "end":
+        return HANGUP_H
+
+    if k == "api":
+        url_lines = max(1, -(-len(n.a("URL", "") or "") // 52))
+        rows = len(n.alist("请求头")) + len(n.alist("参数")) + len(n.alist("返回"))
+        h = (V_PADDING + LABEL_H + TITLE_GAP_H + COMPACT_H
+             + url_lines * 24 + rows * PARAM_ROW_H
+             + branch_section_height(nb) + tips)
+        return min(max(h, API_MIN_H), API_MAX_H)
+
+    if k in ("chat", "announce"):
+        h = V_PADDING + LABEL_H + WELCOME_H + branch_section_height(nb) + tips
+        return max(GLOBAL_CHAT_MIN_H if n.is_global else CHAT_MIN_H, h)
+
+    if k in ("dtmf-nav", "dtmf-collect"):
+        return max(H_DEFAULT, 132 + branch_section_height(nb))
+
+    if k == "condition":
+        real = canvas_branch_list(n)
+        bh = sum(_judge_branch_height(b) for b in real)
+        gap = max(len(real) - 1, 0) * CONTENT_GAP
+        return max(H_DEFAULT,
+                   V_PADDING + LABEL_H + TITLE_GAP_H + bh + gap + tips)
+
+    if k == "worktime":
+        # 画布估算器未单列工时节点，按「话术框(时区) + 分支区」同构处理
+        return max(H_DEFAULT,
+                   V_PADDING + LABEL_H + COMPACT_H + CONTENT_GAP
+                   + branch_section_height(len(canvas_branch_list(n))) + tips)
+
+    if k == "assign":
+        return max(H_DEFAULT,
+                   144 + len(n.alist("变量")) * 56 + branch_section_height(nb))
+
+    if k.startswith("transfer-"):
+        return max(H_DEFAULT, 156 + branch_section_height(nb))
+
+    return H_DEFAULT
+
+
 def layout(design: Design) -> dict[str, tuple[float, float]]:
-    """分层布局：主干水平推进，同层纵向堆叠，节点高度按分支数估算防重叠。"""
-    LAYER_GAP, ORIGIN_X, ORIGIN_Y, ROW_GAP = 440, 350, 300, 64
+    """分层布局：主干水平推进，同层纵向堆叠。
+
+    节点高度用 estimate_node_height() 精确估算（1:1 对齐画布的几何估算器），
+    所以分支多的对话节点会自动拿到更大的纵向空间，不会压到下一个节点。
+    """
     by_no = design.by_no
     succ: dict[str, list[str]] = {}
     for n in design.nodes:
@@ -760,25 +862,45 @@ def layout(design: Design) -> dict[str, tuple[float, float]]:
         cursor = ORIGIN_Y
         for no in sorted(groups[lv], key=lambda k: order[k]):
             n = by_no[no]
-            if n.pos:
+            if n.pos:                       # decompile 带回来的原坐标，原样保留
                 pos[no] = n.pos
                 continue
-            h = 48 + max(0, len(canvas_branch_list(n))) * 48
             pos[no] = (ORIGIN_X + lv * LAYER_GAP, cursor)
-            cursor += h + ROW_GAP
+            cursor += estimate_node_height(n) + ROW_GAP
     return pos
+
+
+STATIC_H_HALF = 86              # 画布以静态 nodeStyle.height(172) 的一半做绘制原点
+
+
+def branch_anchor_dy(kind: str, anchor: int) -> float:
+    """第 anchor(1-based) 个分支出锚点相对节点 y 的偏移。
+
+    导入时 startPoint 的 x/y 会被忽略（只读 anchorIndex），这里算准只为了
+    导出后坐标看着合理、以及万一画布哪天用上这个值不至于错位。
+    """
+    if kind in ("chat", "announce"):
+        head = V_PADDING + LABEL_H + WELCOME_H + TITLE_GAP_H
+    elif kind in ("api", "worktime", "dtmf-nav", "dtmf-collect"):
+        head = V_PADDING + LABEL_H + COMPACT_H + CONTENT_GAP + TITLE_GAP_H
+    else:
+        head = V_PADDING + LABEL_H + TITLE_GAP_H
+    idx = max(1, anchor) - 1
+    return head + idx * (BRANCH_ITEM_H + CONTENT_GAP) + BRANCH_ITEM_H / 2 - STATIC_H_HALF
 
 
 def _edge(src_key: str, tgt_key: str, source_id: str, target_id: str,
           spos: tuple[float, float], tpos: tuple[float, float],
-          anchor: int, etype: str, branch_id: str | None) -> dict[str, Any]:
+          anchor: int, etype: str, branch_id: str | None,
+          kind: str = "chat") -> dict[str, Any]:
+    dy = branch_anchor_dy(kind, anchor) if branch_id else 0
     return {
         "id": edge_id_of(src_key, tgt_key),
         "source": source_id,
         "target": target_id,
         "type": etype,
         "name": "",
-        "startPoint": {"x": spos[0] + 134, "y": spos[1] + anchor * 48, "anchorIndex": anchor},
+        "startPoint": {"x": spos[0] + 134, "y": spos[1] + dy, "anchorIndex": anchor},
         "endPoint": {"x": tpos[0], "y": tpos[1], "anchorIndex": 0},
         # edgeData.branchId 在导入时优先级最高，写上可完全免疫 anchorIndex 偏差
         "edgeData": {"branchId": branch_id} if branch_id else {},
@@ -827,7 +949,7 @@ def build_json(design: Design, base: dict[str, Any] | None = None) -> dict[str, 
                     continue
                 edges.append(_edge(
                     f"{n.key}:{b.content}", by_no[b.target].key, b.bid or "", ids[b.target],
-                    pos[n.no], pos[b.target], i + 1, "custom:cubic-horizontal", b.bid,
+                    pos[n.no], pos[b.target], i + 1, "custom:cubic-horizontal", b.bid, n.kind,
                 ))
         elif n.kind not in TERMINAL_KINDS:
             tgt = n.next or (cbrs[0].target if cbrs else None)

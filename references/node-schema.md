@@ -274,6 +274,57 @@
 
 `nodeData` 都是 `{}`。`startNode` 恰好一条出边；`hangup` 不能有出边。
 
+## 节点几何与自动布局
+
+节点 `x`/`y` 导入时直接采用，所以生成时必须给合理坐标。工具的高度估算
+**1:1 移植自画布自己的估算器** `flow/utils/manualLayoutNodeSizeEstimate.ts`
+（画布「一键整理」用的就是这套常量），常量对照：
+
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `DEFAULT_NODE_WIDTH` | 260 | 节点宽（结束通话节点更窄，但按 260 排不会错） |
+| `NODE_VERTICAL_PADDING` | 24 | 上下内边距合计 |
+| `LABEL_CONTENT_HEIGHT` | 36 | 标题行（图标 24 + 间距 12） |
+| `TITLE_WITH_GAP_HEIGHT` | 24 | 小节标题（12）+ 间距（12） |
+| `WELCOME_CONTENT_HEIGHT` | 108 | 话术框 |
+| `BRANCH_ITEM_HEIGHT` | 40 | **单个分支块** |
+| `CONTENT_GAP` | 12 | **分支之间的间距** |
+| `GLOBAL_TIPS_HEIGHT` | 46 | 全局节点顶部的「全局」标记条 |
+| `PARAM_ROW_HEIGHT` | 36 | 接口节点每行 header/param/return |
+| `JUDGEMENT_BRANCH_*` | 56 / 28 / 34 | 条件分支最小高 / 每行 / 上下留白 |
+| `CHAT_NODE_MIN_HEIGHT` | 168 | 对话节点下限（全局对话节点 214） |
+| `API_NODE_MIN/MAX_HEIGHT` | 420 / 680 | 接口节点被夹在这个区间 |
+
+各类节点的高度公式：
+
+```
+start                 = 120
+end(hangup)           = 48（画布估算器未覆盖，按真实节点样式）
+分支区(n)             = 0            (n = 0)
+                      = 24 + n×40 + (n-1)×12   (n ≥ 1)   ← 每多一个分支 +52px
+chat / announce       = max(168 或 214, 24 + 36 + 108 + 分支区 + 全局条)
+api                   = clamp(24+36+24+40 + ceil(len(url)/52)×24
+                              + 参数行数×36 + 分支区 + 全局条, 420, 680)
+dtmf-nav / -collect   = max(120, 132 + 分支区)
+condition             = max(120, 24+36+24 + Σ条件分支高 + 间距 + 全局条)
+                        条件分支高 = else ? 56 : max(56, 34 + max(2, 条件数×2)×28)
+worktime              = max(120, 24+36+40+12 + 分支区 + 全局条)
+assign                = max(120, 144 + 变量数×56 + 分支区)
+transfer-*            = max(120, 156 + 分支区)
+```
+
+分支数按 `nodeData.branches` **全量**计（含 `global_intent`），与画布估算器一致——
+偏保守，多留空间不会造成重叠。
+
+布局参数：层距 `LAYER_GAP=440`、起点 `(350, 300)`、同层行距 `ROW_GAP=48`。
+同一层内按声明顺序自上而下堆叠，`y_{k+1} = y_k + 节点高 + 48`。
+
+> G6 以静态 `nodeStyle.height`(172) 的一半为绘制原点，节点实际向下延伸真实高度，
+> 因此相邻 y 的差值只要 ≥ 上一个节点的真实高度就不会重叠。
+
+`- 坐标: x,y` 属性（decompile 会自动写入）优先级最高，会跳过自动布局，
+所以改存量画布时节点不会乱跑。
+
 ## 未支持
 
 `tagNode`（话后标签，内部 `voiceLabelCollectionNode`）和 `extension`（分机号）

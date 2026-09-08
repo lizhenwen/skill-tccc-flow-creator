@@ -321,8 +321,17 @@ decompile 会把原 id 写成 `- ID:` 属性，`--base` 靠它精确匹配。
 未命中已经会重复本节点，无应答由 `静默提示` + `静默提示次数` 兜底。线上真实画布也是这么做的。
 
 **Q：坐标怎么算的？会不会重叠？**
-BFS 分层：主干水平推进（层距 440），同层纵向堆叠，节点高度按分支数估算（48 + n×48）预留间距。
-`--base` 模式下保留存量节点原坐标，只给新节点排位。导入后点一次画布「整理」效果更好。
+BFS 分层：主干水平推进（层距 440px），同层纵向堆叠。节点高度不是拍脑袋估的，而是
+**1:1 移植了画布自己的几何估算器** `src/flow/utils/manualLayoutNodeSizeEstimate.ts`
+（「一键整理」用的就是这套常量）。核心规律：
+
+```
+对话节点高度 = 24 + 36 + 108 + 分支区 + (全局节点再 +46)
+分支区(n)    = 24 + n×40 + (n-1)×12      →  每多一个分支恰好 +52px
+```
+
+所以 2 分支节点 284px、16 分支节点 1012px，纵向间距会跟着分支数自动放大。
+`--base` 模式下存量节点保留原坐标，只给新节点排位。导入后点一次画布「整理」效果更好。
 
 **Q：词槽要不要填 slotId？**
 新建流程**不要填**。自定义词槽会写一个临时 id，保存时画布调 `updateAISlot` 自动建槽并回填真实 slotId。
@@ -348,6 +357,7 @@ BFS 分层：主干水平推进（层距 440），同层纵向堆叠，节点高
 | `BUILTIN_SLOT_TYPES` | `CollectionType` 枚举 |
 | `SYSTEM_BRANCH_TYPES` | `VoiceReplyType` 枚举 |
 | `DEFAULT_TRANSFER_MUSIC` / `DEFAULT_AI_TRANSFER_CONTEXT` | `node/TCCC.ts` 的转接节点默认值 |
+| 节点高度常量（`LABEL_H` / `WELCOME_H` / `BRANCH_ITEM_H` / `GLOBAL_TIPS_H` …）与 `estimate_node_height()` | `flow/utils/manualLayoutNodeSizeEstimate.ts`（画布「一键整理」的几何估算器）；样式改了这里必须同步，否则自动布局会重叠 |
 | 校验规则 | `flow/validate/validateFlowDataOnSave.ts` + `validateXGraph.ts` |
 
 回归自测（改完脚本务必跑一遍）：
