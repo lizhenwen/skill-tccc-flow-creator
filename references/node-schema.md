@@ -13,9 +13,7 @@
 }
 ```
 
-`ivrData` 的 key 就是节点 type，按类型分组：
-`startNode` / `chatNode` / `apiCallNode` / `extractVariableNode` / `logicSplitNode` /
-`workTimeNode` / `hangup` / `DTMFNode` / `transfer` / `transferAgentNode`。
+`ivrData` 的 key 就是节点 type，按类型分组：`startNode` / `chatNode` / `apiCallNode` / `extractVariableNode` / `logicSplitNode` /`workTimeNode` / `hangup` / `DTMFNode` / `transfer` / `transferAgentNode`。
 
 ## 节点通用
 
@@ -130,8 +128,7 @@
 }
 ```
 
-- `slotId` 是**账号维度的服务端词槽主键**。不填 → 保存时 `syncConversationSlots`
-  自动建槽并把临时 id 换成真实 slotId。**伪造 slotId 前端不报错，运行时指向不存在的词槽。**
+- `slotId` 是**账号维度的服务端词槽主键**。不填 → 保存时 `syncConversationSlots`自动建槽并把临时 id 换成真实 slotId。**伪造 slotId 前端不报错，运行时指向不存在的词槽。**
 - 内置词槽的 `collectionType` 用类型字面量（`date`），不是 slotId。
 - 有 `entities` 时 `replyMode` 必须是 `intent_with_entity`，且必须有 `entity_success` 分支。
 - 一个节点只能有一个 entity。
@@ -250,8 +247,7 @@
 - `name`：**技能组 id**（也可以是变量表达式），仅 `manual` 有效。留空保存时报「请选择技能组」。
 - `caller` / `callee`：外线/第三方内线的主被叫。
 - `transfer-timeout`（秒，manual 用）与 `timeout`（毫秒，outer/third 用）二选一，另一个填 0。
-- 语音字段成对出现：`xxx-locale` / `xxx-voice` / `xxx` / `xxx-speed`，
-  `-voice` 要跟 `voiceSettings.voiceType` 一致。
+- 语音字段成对出现：`xxx-locale` / `xxx-voice` / `xxx` / `xxx-speed`，`-voice` 要跟 `voiceSettings.voiceType` 一致。
 - `aiTransferContext`：转人工上下文，`enableSummary` 开启后会把通话摘要带给座席。
 - `branches` 只可能放 `global_intent`；**不能有出边**。
 
@@ -277,8 +273,7 @@
 ## 节点几何与自动布局
 
 节点 `x`/`y` 导入时直接采用，所以生成时必须给合理坐标。工具的高度估算
-**1:1 移植自画布自己的估算器** `flow/utils/manualLayoutNodeSizeEstimate.ts`
-（画布「一键整理」用的就是这套常量），常量对照：
+**1:1 移植自画布自己的估算器** `flow/utils/manualLayoutNodeSizeEstimate.ts`（画布「一键整理」用的就是这套常量），常量对照：
 
 | 常量 | 值 | 含义 |
 |---|---|---|
@@ -313,8 +308,7 @@ assign                = max(120, 144 + 变量数×56 + 分支区)
 transfer-*            = max(120, 156 + 分支区)
 ```
 
-分支数按 `nodeData.branches` **全量**计（含 `global_intent`），与画布估算器一致——
-偏保守，多留空间不会造成重叠。
+分支数按 `nodeData.branches` **全量**计（含 `global_intent`），与画布估算器一致——偏保守，多留空间不会造成重叠。
 
 布局参数：层距 `LAYER_GAP=440`、起点 `(350, 300)`、同层行距 `ROW_GAP=48`。
 同一层内按声明顺序自上而下堆叠，`y_{k+1} = y_k + 节点高 + 48`。
@@ -322,10 +316,8 @@ transfer-*            = max(120, 156 + 分支区)
 > G6 以静态 `nodeStyle.height`(172) 的一半为绘制原点，节点实际向下延伸真实高度，
 > 因此相邻 y 的差值只要 ≥ 上一个节点的真实高度就不会重叠。
 
-`- 坐标: x,y` 属性（decompile 会自动写入）优先级最高，会跳过自动布局，
-所以改存量画布时节点不会乱跑。
+`- 坐标: x,y` 属性（decompile 会自动写入）优先级最高，会跳过自动布局，所以改存量画布时节点不会乱跑。
 
 ## 未支持
 
-`tagNode`（话后标签，内部 `voiceLabelCollectionNode`）和 `extension`（分机号）
-在画布里默认隐藏，本工具不生成。需要时手工在画布上加。
+`tagNode`（话后标签，内部 `voiceLabelCollectionNode`）和 `extension`（分机号）在画布里默认隐藏，本工具不生成。需要时手工在画布上加。

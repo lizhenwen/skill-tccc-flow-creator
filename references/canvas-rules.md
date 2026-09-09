@@ -30,8 +30,7 @@ type 名映射（`transformToFlowData` 的 switch，`:1741-2369`）：
 
 ## 导入期：几乎不校验
 
-- 唯一校验是「转换函数不抛异常」：`manage/.../UpdateFlowByImportModal.tsx:84-88`
-  失败提示「请检查 IVR 数据格式是否正确」；JSON 解析失败提示「JSON 格式不合法」。
+- 唯一校验是「转换函数不抛异常」：`manage/.../UpdateFlowByImportModal.tsx:84-88`失败提示「请检查 IVR 数据格式是否正确」；JSON 解析失败提示「JSON 格式不合法」。
 - **没有 schema 校验**，缺字段一律走兜底默认值（`utils.ts:1784-1802`）。
 - 导入时会被改写的字段：
   - `aiBotId` → 强制覆盖为当前机器人 id（`UpdateFlowByImportModal.tsx:76`）
@@ -43,22 +42,17 @@ type 名映射（`transformToFlowData` 的 switch，`:1741-2369`）：
 
 - 节点 `x`/`y` 原样采用；G6 实例不带 layout，`draw()` 直接 `read()`（`QaTree.vue:2157`, `:1109`）。
   自动布局只在用户点「整理」时执行（`:1072 organizeLayout`）。
-- 边的 `startPoint.x/y`、`endPoint.x/y` **被忽略**，只读 `anchorIndex`
-  （`ivrEToX6E` `utils.ts:438-439`）。
-- 多出口节点的出锚点由 `transformMultiExportNodeFlowDataOutEdges`（`:538`）重算：
-  `branchId = edgeData.branchId || 按 source 反查` → `sourceAnchor = branchIndex + 1`；
+- 边的 `startPoint.x/y`、`endPoint.x/y` **被忽略**，只读 `anchorIndex`（`ivrEToX6E` `utils.ts:438-439`）。
+- 多出口节点的出锚点由 `transformMultiExportNodeFlowDataOutEdges`（`:538`）重算：`branchId = edgeData.branchId || 按 source 反查` → `sourceAnchor = branchIndex + 1`；
   查不到才退回 `startPoint.anchorIndex`。
-- 锚点语义：`0` = 左侧入锚点，`1..n` = 第 n 个分支出锚点
-  （`MultiExportNode.js:1905`, `:1949`；反查 `newStyleUtil.ts:79-83`）。
-- `chatNode` 的画布分支 = `filterGlobalReplyClasses(branches)`，即**剔除 `global_intent` 后**的列表
-  （`utils.ts:1820`）。锚点序号要按剔除后的下标算。
+- 锚点语义：`0` = 左侧入锚点，`1..n` = 第 n 个分支出锚点（`MultiExportNode.js:1905`, `:1949`；反查 `newStyleUtil.ts:79-83`）。
+- `chatNode` 的画布分支 = `filterGlobalReplyClasses(branches)`，即**剔除 `global_intent` 后**的列表（`utils.ts:1820`）。锚点序号要按剔除后的下标算。
 - `chatNode.selectBranch` → 内部 `conversationData.listenUserReply`（`utils.ts:1823`）。
   缺省 `false`，**会让节点被判为单出口**。
 
 ## 保存期硬校验（会直接拦住保存）
 
-入口 `agent-flow/src/flow/validate/validateXGraph.ts:2011`：
-`validateNodeDataStep` → `validateRingList` → `validateNodeIsInTree` →（仅保存）`validateFlowDataOnSave`。
+入口 `agent-flow/src/flow/validate/validateXGraph.ts:2011`：`validateNodeDataStep` → `validateRingList` → `validateNodeIsInTree` →（仅保存）`validateFlowDataOnSave`。
 
 ### validateFlowDataOnSave.ts
 
@@ -70,8 +64,7 @@ type 名映射（`transformToFlowData` 的 switch，`:1741-2369`）：
 | 4 | 至少 2 个节点 | 画布中只有一个节点时不允许保存 | `:232-250` |
 | 5 | 不能只有开始 + 结束节点 | —— | `:255-283` |
 
-**单出口节点清单**：`voiceStartNode`、`voiceConversationNode` 且 `listenUserReply===false`、
-`voiceVariableAssignNode`、`voiceLabelCollectionNode`、全部转接类、`voiceEndNode`。
+**单出口节点清单**：`voiceStartNode`、`voiceConversationNode` 且 `listenUserReply===false`、`voiceVariableAssignNode`、`voiceLabelCollectionNode`、全部转接类、`voiceEndNode`。
 
 ### validateXGraph.ts
 
@@ -95,8 +88,7 @@ type 名映射（`transformToFlowData` 的 switch，`:1741-2369`）：
 | 21 | 对话节点分支 content 不能为空 | 存在空回复 | —— |
 
 **注意**：
-- `chatNode` 的「分支必须全连线」只在开始节点 `replyMode==='fixed'` 且监听回复时才要求（`:501-559`），
-  所以正常流程里**允许悬空分支**（命中后重复本节点）。
+- `chatNode` 的「分支必须全连线」只在开始节点 `replyMode==='fixed'` 且监听回复时才要求（`:501-559`），所以正常流程里**允许悬空分支**（命中后重复本节点）。
 - **没有**「节点名必须唯一」的校验（同名不会报错，但人工排查会混乱）。
 - **没有**「必须存在终点节点」的强制校验。
 
@@ -106,13 +98,10 @@ type 名映射（`transformToFlowData` 的 switch，`:1741-2369`）：
 
 - `getEntitiesNeedingSync()`：过滤条件是 `slotId === undefined || !slotType`
   → **不填 slotId 才会触发建槽**。
-- `syncConversationSlotsBeforeSave()`：调 `/tcccadmin/aislot/getAISlotList` 拉取，
-  `/tcccadmin/aislot/updateAISlot` 创建/更新并回填 `slotId`（`:136-199`）。
-- 临时 id → 真实 slotId 的替换：`idMap[String(collectionConfig.collectionType)]`（`:83-98`），
-  所以 `entity.id` 和 `collectionConfig.collectionType` 必须写成**同一个临时 id**。
+- `syncConversationSlotsBeforeSave()`：调 `/tcccadmin/aislot/getAISlotList` 拉取，`/tcccadmin/aislot/updateAISlot` 创建/更新并回填 `slotId`（`:136-199`）。
+- 临时 id → 真实 slotId 的替换：`idMap[String(collectionConfig.collectionType)]`（`:83-98`），所以 `entity.id` 和 `collectionConfig.collectionType` 必须写成**同一个临时 id**。
 - 填了假的 `slotId` + `slotType` → 不会触发同步，前端不报错，**运行时指向不存在的词槽**。
 
 ## 其它上限
 
-- `systemPrompt` 上限 8192，超长静默 `substring` 截断
-  （`agent-flow/src/components/.../persona-requirements.vue:130-132`）。
+- `systemPrompt` 上限 8192，超长静默 `substring` 截断（`agent-flow/src/components/.../persona-requirements.vue:130-132`）。

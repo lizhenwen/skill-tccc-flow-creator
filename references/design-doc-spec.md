@@ -76,13 +76,23 @@
 - 属性行必须以 `- ` 开头且含 `:`（中英文冒号都行）。同名属性重复出现按列表处理。
 - 话术写在 ```` ```prompt ```` 围栏里；话术里含 ``` 时用 `~~~prompt` 围栏。
   **围栏内不做任何解析**，`-`、`#`、`→` 都是普通字符。
+- **围栏内一句话必须写在一行，禁止为了排版折行**。围栏内容是逐字写进 JSON 的，排版换行会变成真实 `\n`，等于把断句发给大模型。换行只用于分段和列表项。
+
+```
+✅  你是本快递公司的官方客服，语气自然口语化，用短句，不称呼客户姓名。
+
+❌  你是本快递公司的官方客服，语气自然口语化，用短句，
+    不称呼客户姓名。
+```
+
+> 写错了不用手改：`build` 不带 `--base` 时会自动合并（终端会打印「[整形] 合并了 N 处」），
+> 或用 `tccc_flow.py rewrap 设计稿.md` 一键规整。校验里对应 **W11**。
 - `分支：` 单独一行，之后的 `- ` 行都是分支。
 - 箭头 `→`（也接受 `->` / `=>`）后面必须是节点编号，编号后可跟节点名（只为可读，不校验）。
 - **分支不写箭头 = 悬空分支**，命中后重复本节点，这是合法设计，校验里报 W5 提醒确认。
 - `- ID: node-xxx` / `- 坐标: 683,270`：decompile 自动写入，用于 `--base` 精确匹配与保位；
   新写设计稿不用管，坐标会自动分层布局。
-- `- 触发: <全局触发语>`：任何节点类型都可用，等价于加一条 `global_intent` 分支，
-  写了就自动标记为全局节点。可带 `{标签: ...}`。
+- `- 触发: <全局触发语>`：任何节点类型都可用，等价于加一条 `global_intent` 分支，写了就自动标记为全局节点。可带 `{标签: ...}`。
 
 ## 13 类节点
 
@@ -175,8 +185,7 @@
 ```
 
 - 符号运算符：`==` `!=` `>=` `<=` `>` `<`
-- 单词运算符（与画布导出一致）：`gt` `lt` `gte` `lte` `eq` `neq` `contains` `not_contains`
-  `in` `not_in` `exists` `not_exists`；中文别名：`大于` `小于` `包含` `属于` `存在` `为空` 等
+- 单词运算符（与画布导出一致）：`gt` `lt` `gte` `lte` `eq` `neq` `contains` `not_contains``in` `not_in` `exists` `not_exists`；中文别名：`大于` `小于` `包含` `属于` `存在` `为空` 等
 - `exists` / `not_exists` 是单目，右边不写值
 - 多条件用 `且`（and）或 `或`（or）连接，一条分支内不要混用
 - `如果 LLM: <判断语>` → `method=llm`
@@ -243,11 +252,15 @@
 
 ```bash
 PY=/Users/lizhenwen/.workbuddy/binaries/python/versions/3.13.12/bin/python3
-$PY scripts/tccc_flow.py build 设计稿.md -o 流程.json [--base 底座.json] [--report 报告.md] [--mermaid 图.mmd]
+$PY scripts/tccc_flow.py build 设计稿.md -o 流程.json [--base 底座.json] [--report 报告.md] [--mermaid 图.mmd] [--rewrap|--no-rewrap]
 $PY scripts/tccc_flow.py validate 流程.json [--design 设计稿.md] [--report 报告.md]
 $PY scripts/tccc_flow.py decompile 画布.json -o 设计稿.md [--title 名称]
+$PY scripts/tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
 ```
 
 - `build` 有 error 时不写 JSON（`--force` 可强行写出，仅调试用），退出码 2。
 - `--base`：md 未表达的字段从底座逐字继承；节点按 `- ID:` 匹配，分支 id 消耗式复用。
-- `validate` 传 `--design` 才能检查「环境注入变量」和话术三段结构。
+- `--rewrap`：合并话术里的排版硬折行。**不带 `--base` 时默认开启**（新建流程），带 `--base` 时默认关闭（改存量画布优先保真）；可用 `--no-rewrap` / `--rewrap` 显式覆盖。
+- `rewrap` 子命令：修 Markdown 文件本身。只处理正文段落与 ```prompt 围栏，
+  ```bash / ```json / 无标记的代码块、表格、标题、列表标记一律不动。
+- `validate` 传 `--design` 才能检查「环境注入变量」、话术三段结构和硬折行。

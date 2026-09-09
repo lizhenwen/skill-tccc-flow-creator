@@ -254,6 +254,7 @@ class Design:
     nodes: list[Node] = field(default_factory=list)
     passthrough: list[tuple[str, str]] = field(default_factory=list)  # (section 标题, 原文)
     injected_vars: list[str] = field(default_factory=list)
+    rewrap_stats: int = 0            # build 时合并掉的硬折行数量
 
     @property
     def by_no(self) -> dict[str, Node]:
@@ -271,6 +272,148 @@ def _to_num(v: str) -> float | int:
         return int(f) if f.is_integer() else f
     except ValueError:
         return 0
+
+
+# ============================================================================
+# 2.5 硬折行修复（rewrap）
+#
+# 背景：AI 写 Markdown 时习惯按 80~100 字符硬折行，中文句子常在逗号处被劈成两行。
+# Markdown 预览会把单换行合并，所以看不出问题；但 ```prompt 围栏是原样逐字写进
+# JSON 的，这些排版换行就变成了真实 \n，等于把断句直接发给大模型。
+# 这里把「明显属于排版折行」的地方合回一行，只处理高置信度情形，宁可漏改不误改。
+# ============================================================================
+
+SENT_END = "。！？；!?;…"                    # 句末标点：到这里才算一句说完
+CLOSERS = "”’\"'」』）)】》>*_`~"              # 收尾符号/强调符号，要剥掉再判断句末
+# 这些开头的行不可能是「上一句的续写」
+STRUCT_PREFIX = ("#", "-", "*", "+", ">", "|", "```", "~~~", "=", "→", "->", "=>")
+NUM_LIST_RE = re.compile(r"^\s*(?:\d+\s*[.)、．]|[①-⑳]|[a-zA-Z]\s*[.)])")
+DIALOG_RE = re.compile(r"^\s*(?:你|我|客户|用户|机器人|坐席|AI|Agent)\s*[:：]")
+# 「字段名：值」式的清单行（如「对话示例二：」「客户的收货省：${收件省}」），
+# 这类行是独立条目，不是上一句的续写
+FIELD_LINE_RE = re.compile(r"^\s*[^：:，。！？；\s]{1,20}\s*[：:]")
+# 设计稿的结构关键字，绝不能被并到上一行去
+DESIGN_KEYWORD_RE = re.compile(r"^\s*(?:分支|环境配置|变量表|假设与待确认|节点|全局提示词)\s*[:：]?\s*$")
+HR_RE = re.compile(r"^\s*(?:-{3,}|={3,}|\*{3,}|_{3,})\s*$")
+ASCII_WORD_RE = re.compile(r"[0-9A-Za-z_$}{)\]]")
+VAR_TAIL_RE = re.compile(r"\$\{[^}]*\}\s*$")     # 以 ${变量} 收尾，多半是字段行
+
+
+def _can_absorb(line: str) -> bool:
+    """这一行是否「有资格」把下一行吸收进来。
+
+    标题 / 围栏标记 / 表格 / 水平线 / 引用是独立结构块，哪怕行尾没有标点，
+    也绝不能把下一行并进来（否则会出现「# 人设你是本公司客服」这种事故）。
+    以 ${变量} 收尾的行多半是「字段名：${变量}」清单，同样不吸收。
+    """
+    s = line.strip()
+    if not s:
+        return False
+    if s.startswith(("#", "```", "~~~", "|", ">")):
+        return False
+    if VAR_TAIL_RE.search(s):
+        return False
+    return not HR_RE.match(s)
+
+
+def _ends_sentence(line: str) -> bool:
+    """这一行是否已经把话说完（不需要和下一行合并）。"""
+    s = line.rstrip()
+    if not s:
+        return True
+    if line.endswith("  "):                 # Markdown 的显式硬换行，尊重作者意图
+        return True
+    core = s.rstrip(CLOSERS)
+    return (core[-1] in SENT_END) if core else True
+
+
+def _is_continuation(line: str) -> bool:
+    """下一行是否是上一句的续写（而不是新的结构块）。"""
+    s = line.strip()
+    if not s:
+        return False
+    if s.startswith(STRUCT_PREFIX):
+        return False
+    if DESIGN_KEYWORD_RE.match(s):
+        return False
+    if FIELD_LINE_RE.match(s):              # 「字段名：值」清单行是独立条目
+        return False
+    return not (NUM_LIST_RE.match(s) or DIALOG_RE.match(s))
+
+
+def _join_two(prev: str, nxt: str) -> str:
+    """拼接两行：中英文之间补空格，纯中文直接接上。"""
+    a, b = prev.rstrip(), nxt.strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    need_space = bool(ASCII_WORD_RE.search(a[-1])) and bool(ASCII_WORD_RE.search(b[0]))
+    return a + (" " if need_space else "") + b
+
+
+def rewrap_text(text: str, *, in_fence_only: bool | None = None) -> tuple[str, int]:
+    """把排版硬折行合回一行。返回 (新文本, 合并次数)。
+
+    - 表格行（|）、代码围栏、列表/标题等结构行一律不动
+    - 只有「上一行没说完 + 下一行是续写」才合并
+    - in_fence_only=None：不区分围栏（用于纯话术文本）
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    merged = 0
+    fence: str | None = None
+    fence_kind = ""
+    for raw in lines:
+        stripped = raw.lstrip()
+        # 围栏开合
+        if fence is None and (stripped.startswith("```") or stripped.startswith("~~~")):
+            fence = stripped[:3]
+            fence_kind = stripped[3:].strip().lower()
+            out.append(raw)
+            continue
+        if fence is not None:
+            if stripped.startswith(fence):
+                fence, fence_kind = None, ""
+                out.append(raw)
+                continue
+            # 只有 ```prompt 围栏里的话术需要修；```bash / ```json / 无标记的
+            # 目录树和命令输出一律原样保留
+            if in_fence_only is False or fence_kind != "prompt":
+                out.append(raw)
+                continue
+        elif in_fence_only is True:
+            out.append(raw)
+            continue
+
+        if (out and _can_absorb(out[-1]) and "|" not in out[-1]
+                and not _ends_sentence(out[-1]) and _is_continuation(raw)):
+            out[-1] = _join_two(out[-1], raw)
+            merged += 1
+            continue
+        out.append(raw)
+    return "\n".join(out), merged
+
+
+def find_hard_wraps(text: str) -> list[str]:
+    """找出疑似排版折行的位置，返回可读提示（用于校验报告）。"""
+    hits: list[str] = []
+    lines = text.split("\n")
+    fence: str | None = None
+    for i, raw in enumerate(lines):
+        stripped = raw.lstrip()
+        if fence is None and (stripped.startswith("```") or stripped.startswith("~~~")):
+            fence = stripped[:3]
+            continue
+        if fence is not None:
+            if stripped.startswith(fence):
+                fence = None
+            continue
+        if (_can_absorb(raw) and "|" not in raw and not _ends_sentence(raw)
+                and i + 1 < len(lines) and _is_continuation(lines[i + 1])):
+            hits.append(f"「…{raw.strip()[-14:]}」+「{lines[i + 1].strip()[:14]}…」")
+    return hits
+
 
 
 # ============================================================================
@@ -907,7 +1050,18 @@ def _edge(src_key: str, tgt_key: str, source_id: str, target_id: str,
     }
 
 
-def build_json(design: Design, base: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_json(design: Design, base: dict[str, Any] | None = None,
+               rewrap: bool = True) -> dict[str, Any]:
+    """rewrap=True 时把话术里的排版硬折行合回一行（--base 保真模式下调用方会关掉）。"""
+    if rewrap:
+        design.rewrap_stats = 0
+        for _n in design.nodes:
+            if _n.prompt:
+                _n.prompt, _m = rewrap_text(_n.prompt)
+                design.rewrap_stats += _m
+        if design.system_prompt:
+            design.system_prompt, _m = rewrap_text(design.system_prompt)
+            design.rewrap_stats += _m
     by_no = design.by_no
     base_by_id: dict[str, dict[str, Any]] = {}
     if base:
@@ -1536,6 +1690,21 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
     if gcount > 3:
         add("warn", "W3", "画布", f"全局节点 {gcount} 个：全局分支会参与每个节点的意图识别，建议 ≤3")
 
+    # 硬折行（一句话没写完就换行）
+    if design:
+        for nd_ in design.nodes:
+            hits = find_hard_wraps(nd_.prompt) if nd_.prompt else []
+            if hits:
+                add("warn", "W11", nd_.key,
+                    f"话术里有 {len(hits)} 处一句话没写完就换行，这些换行会原样写进 JSON 传给大模型："
+                    + "；".join(hits[:3]) + ("…" if len(hits) > 3 else "")
+                    + "。修复：build 时加 --rewrap，或把断句合成一行")
+        sp_hits = find_hard_wraps(design.system_prompt or "")
+        if sp_hits:
+            add("warn", "W11", "全局提示词",
+                f"systemPrompt 里有 {len(sp_hits)} 处一句话没写完就换行："
+                + "；".join(sp_hits[:3]) + ("…" if len(sp_hits) > 3 else ""))
+
     # 话术三段结构
     if design:
         for nd_ in design.nodes:
@@ -1903,7 +2072,9 @@ def cmd_build(args: argparse.Namespace) -> int:
     src = Path(args.design)
     design = parse_design(src.read_text(encoding="utf-8"))
     base = _load_json(args.base) if args.base else None
-    flow = build_json(design, base)
+    # 新建流程默认修硬折行；--base 改存量画布时默认保真不动内容
+    rewrap = args.rewrap if args.rewrap is not None else (base is None)
+    flow = build_json(design, base, rewrap=rewrap)
     issues = validate(flow, design)
     errs = [i for i in issues if i.level == "error"]
 
@@ -1921,6 +2092,8 @@ def cmd_build(args: argparse.Namespace) -> int:
     n_edges = sum(len(n["outEdges"]) for v in flow["ivrData"].values() for n in v)
     print(f"[OK] {out}  节点 {n_nodes} / 连线 {n_edges} / "
           f"error {len(errs)} / warn {len(issues) - len(errs)}")
+    if rewrap and design.rewrap_stats:
+        print(f"[整形] 合并了 {design.rewrap_stats} 处「一句话没写完就换行」的排版折行")
     print(f"[报告] {report_path}")
     if args.mermaid:
         Path(args.mermaid).write_text(mermaid(design), encoding="utf-8")
@@ -1951,6 +2124,35 @@ def cmd_decompile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rewrap(args: argparse.Namespace) -> int:
+    """把 Markdown 里「一句话没写完就换行」的排版折行合回一行。
+
+    正文段落与 ```prompt 围栏会被处理；```bash / ```json 等代码围栏、表格、
+    列表/标题等结构行一律不动。
+    """
+    targets: list[Path] = []
+    for t in args.paths:
+        pt = Path(t)
+        targets.extend(sorted(pt.rglob("*.md")) if pt.is_dir() else [pt])
+    total = 0
+    for f in targets:
+        src = f.read_text(encoding="utf-8")
+        new_text, merged = rewrap_text(src)
+        if merged and not args.dry_run:
+            f.write_text(new_text, encoding="utf-8")
+        if merged:
+            total += merged
+            mark = "[待修]" if args.dry_run else "[已修]"
+            print(f"{mark} {f}  合并 {merged} 处")
+            if args.verbose:
+                for h in find_hard_wraps(src)[:8]:
+                    print(f"        {h}")
+        elif args.verbose:
+            print(f"[干净] {f}")
+    print(f"共 {len(targets)} 个文件，{'待' if args.dry_run else '已'}合并 {total} 处硬折行")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="TCCC AI 画布：Markdown 设计稿 <-> 画布 JSON")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1962,6 +2164,10 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--report")
     b.add_argument("--mermaid")
     b.add_argument("--force", action="store_true", help="即使有 error 也写出 JSON（仅调试用）")
+    b.add_argument("--rewrap", dest="rewrap", action="store_true", default=None,
+                   help="把话术里的排版硬折行合回一行（不带 --base 时默认开启）")
+    b.add_argument("--no-rewrap", dest="rewrap", action="store_false",
+                   help="保留话术里的换行原样不动")
     b.set_defaults(func=cmd_build)
 
     v = sub.add_parser("validate", help="校验画布 JSON")
@@ -1969,6 +2175,12 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--design")
     v.add_argument("--report")
     v.set_defaults(func=cmd_validate)
+
+    rw = sub.add_parser("rewrap", help="修复 Markdown 里一句话没写完就换行的排版折行")
+    rw.add_argument("paths", nargs="+", help="md 文件或目录（目录会递归找 *.md）")
+    rw.add_argument("--dry-run", action="store_true", help="只报告不改文件")
+    rw.add_argument("-v", "--verbose", action="store_true")
+    rw.set_defaults(func=cmd_rewrap)
 
     dcp = sub.add_parser("decompile", help="画布 JSON -> 设计稿")
     dcp.add_argument("flow")
