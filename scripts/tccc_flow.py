@@ -2060,10 +2060,11 @@ def _decompile_branches(kind: str, n: dict[str, Any], no_of: dict[str, str],
 #   ├── 20-假设与待确认.md    # 任意其它 ## 章节，一章一文件，原样透传
 #   ├── 30-全局提示词.md      # ## 全局提示词，整篇一个文件（systemPrompt 本来就是一整块）
 #   ├── 40-变量表.md
-#   └── 50-节点/              # 一个节点一个文件，可再用子目录分组
-#       ├── 010-N01-开始通话.md
-#       └── 020-N02-开场问题识别.md
+#   └── 50-节点/              # 一个节点一个文件，文件名就是节点编号
+#       ├── N01-开始通话.md
+#       └── N02-开场问题识别.md
 #
+# 章节按数字前缀排，节点按编号数值排（N9 在 N10 前，与文件树的自然排序一致）。
 # 只有节点是拆片的（几十上百个），章节一律一章一文件。目录角色靠目录名识别
 # （节点/nodes；全局提示词/prompt 目录仅为兼容手工拆片保留），认不出来时嗅探首行是不是
 # `### Nxx …`。合并 = 按序拼接，不做任何语义加工，所以 split → assemble 是无损往返。
@@ -2072,6 +2073,7 @@ def _decompile_branches(kind: str, n: dict[str, Any], no_of: dict[str, str],
 GEN_BANNER = "<!-- 本文件由 src/ 目录编译生成，请勿直接编辑；改动请改 src/ 下的分片再重新 build。 -->"
 
 SEQ_PREFIX_RE = re.compile(r"^(\d+)\s*[-_.]?\s*")
+NODE_SEQ_RE = re.compile(r"^N(\d+)", re.I)
 NODES_DIR_ALIASES = {"节点", "nodes", "node"}
 PROMPT_DIR_ALIASES = {"全局提示词", "prompt", "prompts", "systemprompt", "system-prompt"}
 FNAME_BAD_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff_]+")
@@ -2088,9 +2090,18 @@ def _strip_seq(name: str) -> str:
 
 
 def _src_sort_key(p: Path) -> tuple[int, int, str]:
-    """带数字前缀的按数字排在前，其余按名字排在后。"""
+    """排序：数字前缀（章节）在前，`Nxx` 节点编号在后，都按**数值**比而不是字典序。
+
+    按数值比是为了 `N9` 排在 `N10` 前面——这也是 Finder / IDE 文件树的自然排序口径，
+    所以文件树里看到的顺序就是合并稿里的顺序。
+    """
     m = SEQ_PREFIX_RE.match(p.name)
-    return (0, int(m.group(1)), p.name) if m else (1, 0, p.name)
+    if m:
+        return (0, int(m.group(1)), p.name)
+    m = NODE_SEQ_RE.match(p.name)
+    if m:
+        return (1, int(m.group(1)), p.name)
+    return (2, 0, p.name)
 
 
 def _src_entries(d: Path) -> list[Path]:
@@ -2242,13 +2253,12 @@ def _split_nodes(body: list[str]) -> list[tuple[str, str]]:
     if not chunks:
         raise DesignError("「## 节点」章节里没有解析到任何节点（节点标题格式：### N01 名称 [kind]）")
 
-    width = max(3, len(str(10 * len(chunks))))
     out: list[tuple[str, str]] = []
     if [x for x in pre if x.strip()]:
-        out.append(("0".zfill(width) + "-节点说明.md", "\n".join(pre).strip("\n") + "\n"))
-    for i, (no, name, lines) in enumerate(chunks, start=1):
-        fn = f"{i * 10:0{width}d}-{no}-{_safe_name(name)}.md"
-        out.append((fn, "\n".join(lines).strip("\n") + "\n"))
+        out.append(("000-节点说明.md", "\n".join(pre).strip("\n") + "\n"))
+    for no, name, lines in chunks:
+        # 文件名直接用节点编号：文件树按编号正序排，改 N45 就找 N45-*.md
+        out.append((f"{no}-{_safe_name(name)}.md", "\n".join(lines).strip("\n") + "\n"))
     return out
 
 
