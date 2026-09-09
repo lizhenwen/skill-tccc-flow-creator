@@ -1455,6 +1455,7 @@ class Issue:
     code: str
     where: str
     msg: str
+    src: str = ""    # 出问题的 src 分片相对路径（build src 时回填）
 
 
 def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
@@ -1725,6 +1726,32 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
     return uniq
 
 
+def print_issues(issues: list[Issue], agg_from: int = 10, name_per_line: int = 4) -> None:
+    """把校验结果打到终端。默认不落盘报告，所以 warning 必须在这里说全。
+
+    条数多了逐条列会淹掉真正要看的东西，超过 agg_from 条就按「编码 + 同一句说明」聚合，
+    位置逐个列出（同一类问题往往横跨十几个节点，只列前几个等于让人自己去猜剩下的）。
+    """
+    for lv in ("error", "warn"):
+        arr = [i for i in issues if i.level == lv]
+        if not arr:
+            continue
+        print(f"[{lv}] {len(arr)} 项")
+        if len(arr) <= agg_from:
+            for i in arr:
+                loc = f"（{i.src}）" if i.src else ""
+                print(f"  {i.code} {i.where}{loc}：{i.msg}")
+            continue
+        groups: dict[tuple[str, str], list[Issue]] = {}
+        for i in arr:
+            groups.setdefault((i.code, i.msg), []).append(i)
+        for (code, msg), g in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            print(f"  {code} ×{len(g)}  {msg}")
+            names = [i.where for i in g]
+            for k in range(0, len(names), name_per_line):
+                print("       " + "、".join(names[k:k + name_per_line]))
+
+
 def render_report(issues: list[Issue], flow: dict[str, Any], title: str = "") -> str:
     ivr = flow.get("ivrData") or {}
     errs = [i for i in issues if i.level == "error"]
@@ -1746,7 +1773,8 @@ def render_report(issues: list[Issue], flow: dict[str, Any], title: str = "") ->
         lines.append("| 编码 | 位置 | 说明 |")
         lines.append("|---|---|---|")
         for i in arr:
-            lines.append(f"| {i.code} | {i.where} | {i.msg.replace('|', '/')} |")
+            where = f"{i.where}<br>`{i.src}`" if i.src else i.where
+            lines.append(f"| {i.code} | {where} | {i.msg.replace('|', '/')} |")
         lines.append("")
     lines += [
         "## 导入后人工验收清单",
@@ -2403,23 +2431,31 @@ def cmd_build(args: argparse.Namespace) -> int:
 
     flow = build_json(design, base, rewrap=rewrap)
     issues = validate(flow, design)
-    if origin:                       # 报告里的节点位置带上源文件，便于直接打开修改
-        line_of = {n.key: n.line for n in design.nodes}
+    if origin:                       # 问题位置带上源文件，便于直接打开修改
+        # 校验里的位置有两种写法：设计稿口径「N02 采集运单号」和 JSON 口径「采集运单号」
+        line_of: dict[str, int] = {}
+        for n in design.nodes:
+            line_of[n.key] = n.line
+            line_of.setdefault(n.name, n.line)
         for i in issues:
             ln = line_of.get(i.where)
             f = src_file_of_line(origin, ln) if ln else None
             if f is not None:
-                i.where = f"{i.where}<br>`{rel_path(f, proj)}`"
+                i.src = str(rel_path(f, proj))
     errs = [i for i in issues if i.level == "error"]
 
     out = Path(args.output) if args.output else default_json
-    report_path = Path(args.report) if args.report else out.with_name(out.stem + "-校验报告.md")
-    report_path.write_text(render_report(issues, flow, design.title), encoding="utf-8")
+    report_path = Path(args.report) if args.report else None
+    if report_path:                  # 校验结果默认只打终端，显式要报告才落盘
+        report_path.write_text(render_report(issues, flow, design.title), encoding="utf-8")
 
     if errs and not args.force:
-        print(f"[FAIL] {len(errs)} 项 error，未写出 JSON。报告：{report_path}", file=sys.stderr)
+        print(f"[FAIL] {len(errs)} 项 error，未写出 JSON", file=sys.stderr)
         for i in errs[:20]:
-            print(f"  - [{i.code}] {i.where}：{i.msg}", file=sys.stderr)
+            loc = f"（{i.src}）" if i.src else ""
+            print(f"  - [{i.code}] {i.where}{loc}：{i.msg}", file=sys.stderr)
+        if report_path:
+            print(f"[报告] {report_path}", file=sys.stderr)
         return 2
     if md_out is not None:
         body = text
@@ -2438,7 +2474,9 @@ def cmd_build(args: argparse.Namespace) -> int:
           f"error {len(errs)} / warn {len(issues) - len(errs)}")
     if rewrap and design.rewrap_stats:
         print(f"[整形] 合并了 {design.rewrap_stats} 处「一句话没写完就换行」的排版折行")
-    print(f"[报告] {report_path}")
+    print_issues(issues)
+    if report_path:
+        print(f"[报告] {report_path}")
     if args.mermaid:
         Path(args.mermaid).write_text(mermaid(design), encoding="utf-8")
         print(f"[流程图] {args.mermaid}")
@@ -2479,12 +2517,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
     design = parse_design(Path(args.design).read_text(encoding="utf-8")) if args.design else None
     issues = validate(flow, design)
     errs = [i for i in issues if i.level == "error"]
-    text = render_report(issues, flow, design.title if design else "")
     if args.report:
-        Path(args.report).write_text(text, encoding="utf-8")
+        Path(args.report).write_text(
+            render_report(issues, flow, design.title if design else ""), encoding="utf-8")
         print(f"[报告] {args.report}")
-    else:
-        print(text)
+    ivr = flow.get("ivrData") or {}
+    print(f"[{'FAIL' if errs else 'OK'}] {args.flow}  "
+          f"节点 {sum(len(v) for v in ivr.values())} / "
+          f"连线 {sum(len(n.get('outEdges') or []) for v in ivr.values() for n in v)} / "
+          f"error {len(errs)} / warn {len(issues) - len(errs)}")
+    print_issues(issues)
     return 2 if errs else 0
 
 
@@ -2537,7 +2579,7 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--emit-md", help="合并稿输出路径；传目录时默认 <父目录名>-设计稿.md")
     b.add_argument("--no-emit-md", action="store_true", help="只出 JSON，不写合并稿 md")
     b.add_argument("--base", help="已导出的真实画布 JSON，作为 voiceSettings / 未表达字段的底座")
-    b.add_argument("--report")
+    b.add_argument("--report", help="额外把校验结果落成 markdown 报告（默认只打终端）")
     b.add_argument("--mermaid")
     b.add_argument("--force", action="store_true", help="即使有 error 也写出 JSON（仅调试用）")
     b.add_argument("--rewrap", dest="rewrap", action="store_true", default=None,
