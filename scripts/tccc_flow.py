@@ -3,8 +3,10 @@
 """
 tccc_flow.py — 腾讯云呼叫中心 TCCC「AI 画布」流程编译工具（零三方依赖）
 
-三个子命令：
-  build      Markdown 设计稿  ->  画布可导入 JSON（+ 校验报告）
+子命令：
+  build      Markdown 设计稿 / src 目录 ->  画布可导入 JSON（+ 合并稿 md + 校验报告）
+  split      整篇设计稿 / 画布 JSON     ->  src/ 分片目录（一节点一文件）
+  assemble   src/ 分片目录              ->  整篇设计稿 md
   validate   画布 JSON        ->  校验报告（error 阻断 / warning 提示）
   decompile  画布 JSON        ->  Markdown 设计稿（可再 build --base 回编译）
 
@@ -1944,6 +1946,17 @@ def _decompile_attrs(kind: str, nd: dict[str, Any]) -> list[str]:
             a.append(f"- 主叫: {nd['caller']}")
         if nd.get("callee"):
             a.append(f"- 被叫: {nd['callee']}")
+        # 这三段话术必须带出来：不写的话回编译会被默认话术覆盖，等于偷偷改了线上播报。
+        # 只带 tts: 开头的合成语音；录音文件 id 无法用设计稿表达，交给 --base 继承。
+        for zh, fld in (("转接提示音", "transferring-sound"),
+                        ("超时话术", "transfer-timeout-music"),
+                        ("失败话术", "transfer-error")):
+            v = str(nd.get(fld) or "")
+            if v.startswith("tts:"):
+                a.append(f"- {zh}: {_esc(v[4:])}")
+        secs = nd.get("transfer-timeout") or int(_to_num(nd.get("timeout") or 0)) // 1000
+        if secs:
+            a.append(f"- 转接超时(秒): {secs}")
         if (nd.get("aiTransferContext") or {}).get("enableSummary"):
             a.append("- 转人工带摘要: 是")
     elif kind == "transfer-agent":
@@ -2035,6 +2048,319 @@ def _decompile_branches(kind: str, n: dict[str, Any], no_of: dict[str, str],
 
 
 # ============================================================================
+# 6.5 src 分片：整篇设计稿 <-> src/ 目录（一个节点一个文件）
+#
+# 为什么要拆：一份 100+ 节点的设计稿有几万字，改一个节点要在几千行里找，
+# diff 也看不清。拆成 src/ 后每个节点是独立小文件，改哪个节点就动哪个文件。
+#
+# 目录约定（src/ 下的条目按「数字前缀」排序，顺序 = 合并稿里的章节顺序）：
+#   src/
+#   ├── 00-流程信息.md        # `# 流程：xxx` 标题 + 模块说明
+#   ├── 10-环境配置.md        # ## 环境配置
+#   ├── 20-假设与待确认.md    # 任意其它 ## 章节，一章一文件，原样透传
+#   ├── 30-全局提示词/        # systemPrompt 按 `# 段落` 拆片
+#   │   ├── 10-人设.md
+#   │   └── 20-任务.md
+#   ├── 40-变量表.md
+#   └── 50-节点/              # 一个节点一个文件，可再用子目录分组
+#       ├── 010-N01-开始通话.md
+#       └── 020-N02-开场问题识别.md
+#
+# 目录角色靠目录名识别（节点/nodes、全局提示词/prompt），认不出来时嗅探首行是不是
+# `### Nxx …`。合并 = 按序拼接，不做任何语义加工，所以 split → assemble 是无损往返。
+# ============================================================================
+
+GEN_BANNER = "<!-- 本文件由 src/ 目录编译生成，请勿直接编辑；改动请改 src/ 下的分片再重新 build。 -->"
+
+SEQ_PREFIX_RE = re.compile(r"^(\d+)\s*[-_.]?\s*")
+NODES_DIR_ALIASES = {"节点", "nodes", "node"}
+PROMPT_DIR_ALIASES = {"全局提示词", "prompt", "prompts", "systemprompt", "system-prompt"}
+FNAME_BAD_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff_]+")
+SECTION_PROMPT_RE = re.compile(r"^(全局提示词|systemPrompt)", re.I)
+
+
+def _safe_name(s: str, limit: int = 32) -> str:
+    """把章节名/节点名压成安全文件名：保留中文与字母数字，其它一律换成 -。"""
+    out = FNAME_BAD_RE.sub("-", s.strip()).strip("-")
+    return (out[:limit].rstrip("-") or "未命名")
+
+
+def _strip_seq(name: str) -> str:
+    return SEQ_PREFIX_RE.sub("", name)
+
+
+def _src_sort_key(p: Path) -> tuple[int, int, str]:
+    """带数字前缀的按数字排在前，其余按名字排在后。"""
+    m = SEQ_PREFIX_RE.match(p.name)
+    return (0, int(m.group(1)), p.name) if m else (1, 0, p.name)
+
+
+def _src_entries(d: Path) -> list[Path]:
+    return sorted(
+        [p for p in d.iterdir()
+         if not p.name.startswith(".") and (p.is_dir() or p.suffix.lower() == ".md")],
+        key=_src_sort_key,
+    )
+
+
+def _iter_src_md(d: Path) -> list[Path]:
+    """递归取目录下的 md，按序号排序（允许用子目录给节点分组）。"""
+    out: list[Path] = []
+    for p in _src_entries(d):
+        out.extend(_iter_src_md(p) if p.is_dir() else [p])
+    return out
+
+
+def _dir_role(p: Path) -> str:
+    """判断 src 子目录的角色：nodes / prompt / other。"""
+    base = _strip_seq(p.name).strip().lower()
+    if base in NODES_DIR_ALIASES:
+        return "nodes"
+    if base in PROMPT_DIR_ALIASES:
+        return "prompt"
+    for f in _iter_src_md(p):                     # 认不出名字就嗅探内容
+        for line in f.read_text(encoding="utf-8").split("\n"):
+            if line.strip():
+                return "nodes" if NODE_HEADER.match(line.strip()) else "other"
+    return "other"
+
+
+class _Emitter:
+    """按行拼接合并稿，同时记录每行来自哪个源文件（用于把报错行号映射回 src）。"""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.origin: list[tuple[Path | None, int]] = []
+
+    def add(self, line: str, src: Path | None = None, ln: int = 0) -> None:
+        self.lines.append(line)
+        self.origin.append((src, ln))
+
+    def add_file(self, path: Path, text: str) -> None:
+        for i, line in enumerate(text.split("\n")):
+            self.add(line, path, i + 1)
+
+    def blank(self) -> None:
+        if self.lines and self.lines[-1].strip():
+            self.add("")
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines).rstrip("\n") + "\n"
+
+
+def assemble_src(src_dir: Path) -> tuple[str, list[tuple[Path | None, int]]]:
+    """src/ 目录 -> 整篇设计稿文本 + 行来源表。"""
+    if not src_dir.is_dir():
+        raise DesignError(f"src 目录不存在：{src_dir}")
+    entries = _src_entries(src_dir)
+    if not entries:
+        raise DesignError(f"src 目录里没有 md 文件或子目录：{src_dir}")
+
+    em = _Emitter()
+    saw_nodes = False
+    for p in entries:
+        if p.is_file():
+            em.add_file(p, p.read_text(encoding="utf-8").strip("\n"))
+            em.blank()
+            continue
+        role = _dir_role(p)
+        files = _iter_src_md(p)
+        if role == "nodes":
+            saw_nodes = True
+            em.add("## 节点")
+            em.blank()
+            for f in files:
+                em.add_file(f, f.read_text(encoding="utf-8").strip("\n"))
+                em.blank()
+        elif role == "prompt":
+            frags = [(f, f.read_text(encoding="utf-8").strip("\n")) for f in files]
+            fence = "~~~" if any("```" in t for _, t in frags) else "```"
+            em.add("## 全局提示词")
+            em.blank()
+            em.add(fence + "prompt")
+            for i, (f, t) in enumerate(frags):
+                if i:
+                    em.add("")                    # 片与片之间恰好一个空行
+                em.add_file(f, t)
+            em.add(fence)
+            em.blank()
+        else:                                      # 认不出角色的目录：原样拼接
+            for f in files:
+                em.add_file(f, f.read_text(encoding="utf-8").strip("\n"))
+                em.blank()
+    if not saw_nodes:
+        raise DesignError(
+            f"{src_dir} 下没有节点目录。请建一个名为「节点」（或 nodes）的子目录，一个节点一个 md")
+    return em.text, em.origin
+
+
+def rel_path(f: Path, base: Path) -> Path:
+    """尽量给出相对 base 的短路径，跨盘/跨树时退回原路径。"""
+    try:
+        return f.resolve().relative_to(base.resolve())
+    except (ValueError, OSError):
+        return f
+
+
+def remap_src_lines(msg: str, origin: list[tuple[Path | None, int]], base: Path) -> str:
+    """把「第 N 行」（合并稿行号）改写成「src 文件:行号」，报错才好定位。"""
+    def rep(m: re.Match[str]) -> str:
+        i = int(m.group(1))
+        if 1 <= i <= len(origin) and origin[i - 1][0] is not None:
+            f, ln = origin[i - 1]
+            assert f is not None
+            return f"{rel_path(f, base)} 第 {ln} 行（合并稿第 {i} 行）"
+        return m.group(0)
+    return re.sub(r"第 (\d+) 行", rep, msg)
+
+
+def src_file_of_line(origin: list[tuple[Path | None, int]], line: int) -> Path | None:
+    return origin[line - 1][0] if 1 <= line <= len(origin) else None
+
+
+def _split_prompt(prompt: str) -> list[tuple[str, str]]:
+    """systemPrompt 按顶层 `# 段落` 拆片。"""
+    body = prompt.strip("\n")
+    if not body.strip():
+        return [("10-全局提示词.md", "\n")]
+    frags: list[tuple[str, list[str]]] = []
+    cur: tuple[str, list[str]] | None = None
+    pre: list[str] = []
+    for raw in body.split("\n"):
+        if raw.startswith("# "):
+            if cur:
+                frags.append(cur)
+            cur = (raw[2:].strip(), [raw])
+            continue
+        (cur[1] if cur else pre).append(raw)
+    if cur:
+        frags.append(cur)
+    out: list[tuple[str, str]] = []
+    seq = 0
+    if [x for x in pre if x.strip()]:
+        out.append(("05-开头.md", "\n".join(pre).strip("\n") + "\n"))
+    for name, lines in frags:
+        seq += 10
+        out.append((f"{seq:02d}-{_safe_name(name)}.md", "\n".join(lines).strip("\n") + "\n"))
+    return out or [("10-全局提示词.md", body + "\n")]
+
+
+def _split_nodes(body: list[str]) -> list[tuple[str, str]]:
+    """`## 节点` 章节按 `### Nxx 名称 [kind]` 拆片，一个节点一个文件。"""
+    chunks: list[tuple[str, str, list[str]]] = []
+    pre: list[str] = []
+    cur: tuple[str, str, list[str]] | None = None
+    fence: str | None = None
+    for raw in body:
+        s = raw.lstrip()
+        if fence is None and (s.startswith("```") or s.startswith("~~~")):
+            fence = s[:3]
+        elif fence is not None and s.startswith(fence):
+            fence = None
+        elif fence is None:
+            m = NODE_HEADER.match(raw.strip())
+            if m:
+                if cur:
+                    chunks.append(cur)
+                cur = (m.group(1), m.group(2).strip(), [raw])
+                continue
+        (cur[2] if cur else pre).append(raw)
+    if cur:
+        chunks.append(cur)
+    if not chunks:
+        raise DesignError("「## 节点」章节里没有解析到任何节点（节点标题格式：### N01 名称 [kind]）")
+
+    width = max(3, len(str(10 * len(chunks))))
+    out: list[tuple[str, str]] = []
+    if [x for x in pre if x.strip()]:
+        out.append(("0".zfill(width) + "-节点说明.md", "\n".join(pre).strip("\n") + "\n"))
+    for i, (no, name, lines) in enumerate(chunks, start=1):
+        fn = f"{i * 10:0{width}d}-{no}-{_safe_name(name)}.md"
+        out.append((fn, "\n".join(lines).strip("\n") + "\n"))
+    return out
+
+
+def split_design(text: str) -> list[tuple[str, str]]:
+    """整篇设计稿 -> [(src 内相对路径, 文件内容)]。纯文本切分，不做语义加工。"""
+    lines = text.replace("\r\n", "\n").split("\n")
+    head: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    cur: tuple[str, list[str]] | None = None
+    fence: str | None = None
+    for raw in lines:
+        s = raw.lstrip()
+        if fence is None and (s.startswith("```") or s.startswith("~~~")):
+            fence = s[:3]
+        elif fence is not None and s.startswith(fence):
+            fence = None
+        elif fence is None and raw.startswith("## "):
+            if cur:
+                sections.append(cur)
+            cur = (raw[3:].strip(), [])
+            continue
+        (cur[1] if cur else head).append(raw)
+    if cur:
+        sections.append(cur)
+    if not sections:
+        raise DesignError("设计稿里没有任何「## 章节」，无法拆分")
+
+    files: list[tuple[str, str]] = []
+    head_txt = "\n".join(x for x in head if x.strip() != GEN_BANNER).strip("\n")
+    head_txt = re.sub(r"\n{3,}", "\n\n", head_txt)     # 去掉 banner 留下的空行
+    files.append(("00-流程信息.md", (head_txt or "# 流程：未命名流程") + "\n"))
+
+    seq = 0
+    for title, body in sections:
+        seq += 10
+        t = title.replace(" ", "")
+        if SECTION_PROMPT_RE.match(t):
+            d = f"{seq:02d}-全局提示词"
+            files += [(f"{d}/{n}", c) for n, c in _split_prompt(_extract_fence(body))]
+        elif t.startswith("节点"):
+            d = f"{seq:02d}-节点"
+            files += [(f"{d}/{n}", c) for n, c in _split_nodes(body)]
+        else:
+            files.append((f"{seq:02d}-{_safe_name(title)}.md",
+                          f"## {title}\n\n" + "\n".join(body).strip("\n") + "\n"))
+    return files
+
+
+def write_src(files: list[tuple[str, str]], target: Path, force: bool = False) -> list[Path]:
+    """落盘 src/。目标目录已有 md 时必须 --force（会先清掉旧 md，避免残留幽灵节点）。"""
+    existing = sorted(target.rglob("*.md")) if target.exists() else []
+    if existing and not force:
+        raise DesignError(
+            f"{target} 下已有 {len(existing)} 个 md 文件。确认要覆盖请加 --force（会先删除旧分片）")
+    for f in existing:
+        f.unlink()
+    for d in sorted((p for p in target.rglob("*") if p.is_dir()),
+                    key=lambda p: len(p.parts), reverse=True):
+        if not any(d.iterdir()):
+            d.rmdir()
+    written: list[Path] = []
+    for rel, content in files:
+        p = target / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        written.append(p)
+    return written
+
+
+def rewrap_files(paths: list[Path]) -> tuple[int, list[Path]]:
+    """就地修复一批 md 的硬折行，返回 (合并处数, 被改动的文件)。"""
+    total, changed = 0, []
+    for f in paths:
+        src = f.read_text(encoding="utf-8")
+        new, merged = rewrap_text(src)
+        if merged:
+            f.write_text(new, encoding="utf-8")
+            total += merged
+            changed.append(f)
+    return total, changed
+
+
+# ============================================================================
 # 7. mermaid（写进设计稿供人审阅）
 # ============================================================================
 
@@ -2070,15 +2396,45 @@ def _load_json(p: str) -> dict[str, Any]:
 
 def cmd_build(args: argparse.Namespace) -> int:
     src = Path(args.design)
-    design = parse_design(src.read_text(encoding="utf-8"))
     base = _load_json(args.base) if args.base else None
     # 新建流程默认修硬折行；--base 改存量画布时默认保真不动内容
     rewrap = args.rewrap if args.rewrap is not None else (base is None)
+
+    origin: list[tuple[Path | None, int]] = []
+    md_out: Path | None = None
+    proj = src.resolve().parent
+    if src.is_dir():
+        # src/ 分片模式：先就地修分片的硬折行，再合并成整篇设计稿
+        if rewrap:
+            merged, changed = rewrap_files(_iter_src_md(src))
+            if merged:
+                print(f"[整形] src 分片里合并了 {merged} 处硬折行（{len(changed)} 个文件）")
+        text, origin = assemble_src(src)
+        stem = proj.name                     # 产物名跟随项目目录名
+        md_out = None if args.no_emit_md else Path(args.emit_md or proj / f"{stem}-设计稿.md")
+        default_json = proj / f"{stem}.json"
+    else:
+        text = src.read_text(encoding="utf-8")
+        md_out = Path(args.emit_md) if args.emit_md else None
+        default_json = src.with_suffix(".json")
+
+    try:
+        design = parse_design(text)
+    except DesignError as e:
+        raise DesignError(remap_src_lines(str(e), origin, proj) if origin else str(e)) from None
+
     flow = build_json(design, base, rewrap=rewrap)
     issues = validate(flow, design)
+    if origin:                       # 报告里的节点位置带上源文件，便于直接打开修改
+        line_of = {n.key: n.line for n in design.nodes}
+        for i in issues:
+            ln = line_of.get(i.where)
+            f = src_file_of_line(origin, ln) if ln else None
+            if f is not None:
+                i.where = f"{i.where}<br>`{rel_path(f, proj)}`"
     errs = [i for i in issues if i.level == "error"]
 
-    out = Path(args.output or src.with_suffix(".json"))
+    out = Path(args.output) if args.output else default_json
     report_path = Path(args.report) if args.report else out.with_name(out.stem + "-校验报告.md")
     report_path.write_text(render_report(issues, flow, design.title), encoding="utf-8")
 
@@ -2087,6 +2443,16 @@ def cmd_build(args: argparse.Namespace) -> int:
         for i in errs[:20]:
             print(f"  - [{i.code}] {i.where}：{i.msg}", file=sys.stderr)
         return 2
+    if md_out is not None:
+        body = text
+        if src.is_dir():                 # 合并稿是产物，顶上盖个「别直接改我」的戳
+            rest = text.split("\n")
+            head = [rest.pop(0)] if rest and rest[0].startswith("# ") else []
+            while rest and not rest[0].strip():
+                rest.pop(0)
+            body = "\n".join(head + ([""] if head else []) + [GEN_BANNER, ""] + rest)
+        md_out.write_text(body, encoding="utf-8")
+        print(f"[设计稿] {md_out}  （由 {src}/ 合并生成）")
     out.write_text(json.dumps(flow, ensure_ascii=False, indent=2), encoding="utf-8")
     n_nodes = sum(len(v) for v in flow["ivrData"].values())
     n_edges = sum(len(n["outEdges"]) for v in flow["ivrData"].values() for n in v)
@@ -2098,6 +2464,35 @@ def cmd_build(args: argparse.Namespace) -> int:
     if args.mermaid:
         Path(args.mermaid).write_text(mermaid(design), encoding="utf-8")
         print(f"[流程图] {args.mermaid}")
+    return 0
+
+
+def cmd_split(args: argparse.Namespace) -> int:
+    src = Path(args.design)
+    if src.suffix.lower() == ".json":
+        text = decompile(_load_json(str(src)), args.title or src.stem)
+    else:
+        text = src.read_text(encoding="utf-8")
+    files = split_design(text)
+    target = Path(args.output) if args.output else src.parent / "src"
+    target.mkdir(parents=True, exist_ok=True)
+    written = write_src(files, target, force=args.force)
+    n_nodes = len([p for p in written if NODE_HEADER.match(
+        p.read_text(encoding="utf-8").split("\n")[0].strip())])
+    print(f"[OK] {target}  {len(written)} 个分片（其中节点 {n_nodes} 个）")
+    for p in written:
+        print(f"  {p.relative_to(target)}")
+    print(f"\n下一步：build 回整篇 md + JSON\n"
+          f"  {Path(sys.argv[0]).name} build {target} [--base 上一版.json]")
+    return 0
+
+
+def cmd_assemble(args: argparse.Namespace) -> int:
+    src = Path(args.src)
+    text, _ = assemble_src(src)
+    out = Path(args.output) if args.output else src.parent / f"{src.parent.name}-设计稿.md"
+    out.write_text(text, encoding="utf-8")
+    print(f"[OK] {out}  {len(text.splitlines())} 行")
     return 0
 
 
@@ -2157,9 +2552,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="TCCC AI 画布：Markdown 设计稿 <-> 画布 JSON")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    b = sub.add_parser("build", help="设计稿 -> 画布 JSON")
-    b.add_argument("design")
-    b.add_argument("-o", "--output")
+    b = sub.add_parser("build", help="设计稿 md 或 src/ 目录 -> 画布 JSON")
+    b.add_argument("design", help="设计稿 md 文件，或 src/ 分片目录（推荐）")
+    b.add_argument("-o", "--output",
+                   help="输出 JSON；传目录时默认 <src父目录>/<父目录名>.json")
+    b.add_argument("--emit-md", help="合并稿输出路径；传目录时默认 <父目录名>-设计稿.md")
+    b.add_argument("--no-emit-md", action="store_true", help="只出 JSON，不写合并稿 md")
     b.add_argument("--base", help="已导出的真实画布 JSON，作为 voiceSettings / 未表达字段的底座")
     b.add_argument("--report")
     b.add_argument("--mermaid")
@@ -2169,6 +2567,18 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--no-rewrap", dest="rewrap", action="store_false",
                    help="保留话术里的换行原样不动")
     b.set_defaults(func=cmd_build)
+
+    sp = sub.add_parser("split", help="整篇设计稿 / 画布 JSON -> src/ 分片目录")
+    sp.add_argument("design", help="设计稿 md，或画布 JSON（会先 decompile）")
+    sp.add_argument("-o", "--output", help="src 目录，默认 <设计稿同级>/src")
+    sp.add_argument("--title", help="输入是 JSON 时的流程名")
+    sp.add_argument("--force", action="store_true", help="目标目录已有分片时覆盖（先删旧 md）")
+    sp.set_defaults(func=cmd_split)
+
+    asm = sub.add_parser("assemble", help="src/ 分片目录 -> 整篇设计稿 md（不编译 JSON）")
+    asm.add_argument("src")
+    asm.add_argument("-o", "--output")
+    asm.set_defaults(func=cmd_assemble)
 
     v = sub.add_parser("validate", help="校验画布 JSON")
     v.add_argument("flow")

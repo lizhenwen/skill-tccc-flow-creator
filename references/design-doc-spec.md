@@ -2,7 +2,49 @@
 
 设计稿是整条链路的唯一真源。`scripts/tccc_flow.py` 按本文件严格解析，写错就编译报错（带行号）。
 
-## 整体骨架
+**实际维护的形态是 `src/` 分片目录**（一个节点一个 md），整篇设计稿由 `build` 合并生成。
+本文件先讲整篇骨架（语法以它为准），再讲 `src/` 怎么切分——两者一一对应，
+`split` / `assemble` 是无损往返，语法规则完全一样。
+
+## src/ 目录约定
+
+```
+<项目目录>/
+├── src/                          ← 唯一真源，人和 AI 只改这里
+│   ├── 00-流程信息.md            # `# 流程：xxx` 标题 +（可选）模块进度说明
+│   ├── 10-环境配置.md            # ## 环境配置
+│   ├── 20-假设与待确认.md        # 其它 ## 章节：一章一文件，原样透传
+│   ├── 30-全局提示词/            # systemPrompt 按顶层 `# 段落` 拆片
+│   │   ├── 10-人设.md
+│   │   ├── 20-任务.md
+│   │   ├── 30-相关信息.md
+│   │   ├── 40-要求.md
+│   │   └── 50-业务知识.md
+│   ├── 40-变量表.md
+│   └── 50-节点/                  # 一个节点一个文件
+│       ├── 010-N01-开始通话.md
+│       ├── 020-N02-开场问题识别.md
+│       └── 500-E4场景/           # 节点多了可以再建子目录分组（可选）
+├── <项目名>-设计稿.md            ← build 产物：整篇合并稿，别手改
+├── <项目名>.json                 ← build 产物：导入画布用
+└── <项目名>-校验报告.md          ← build 产物
+```
+
+合并规则（就是拼接，没有任何语义加工）：
+
+- `src/` 下的条目**按文件名数字前缀排序**，顺序就是合并稿里的章节顺序；无前缀的排在最后按字母序。
+  步长留 10，插新内容用中间号（`095-N50-xxx.md`），不必重排已有文件。
+- 普通 md 文件：原样插入（文件里要自带 `## 章节名` 标题）。
+- 目录按名字识别角色：`节点`/`nodes` → 拼成 `## 节点` 章节；`全局提示词`/`prompt` → 拼成
+  `## 全局提示词` + ```prompt 围栏（片与片之间恰好一个空行）。名字认不出时嗅探首行是不是 `### Nxx …`。
+- 节点目录可以嵌套子目录分组，递归按同一套排序规则展开。
+- 节点分片文件从 `### Nxx 名称 [kind]` 开头，内容与整篇里的节点块**逐字相同**。
+- 全局提示词分片文件是**裸文本**（不带围栏），首行一般是 `# 人设` 这类段落标题。
+
+`build src/` 会：修分片硬折行（就地）→ 合并 → 编译 → 落三份产物；
+报错和校验报告都会标出问题在哪个 src 文件第几行。
+
+## 整体骨架（合并稿形态）
 
 ```markdown
 # 流程：<流程名>
@@ -252,12 +294,20 @@
 
 ```bash
 PY=/Users/lizhenwen/.workbuddy/binaries/python/versions/3.13.12/bin/python3
-$PY scripts/tccc_flow.py build 设计稿.md -o 流程.json [--base 底座.json] [--report 报告.md] [--mermaid 图.mmd] [--rewrap|--no-rewrap]
+$PY scripts/tccc_flow.py build src|设计稿.md [-o 流程.json] [--emit-md 合并稿.md|--no-emit-md] \
+                               [--base 底座.json] [--report 报告.md] [--mermaid 图.mmd] [--rewrap|--no-rewrap]
+$PY scripts/tccc_flow.py split 设计稿.md|画布.json [-o src] [--force] [--title 名称]
+$PY scripts/tccc_flow.py assemble src [-o 设计稿.md]
 $PY scripts/tccc_flow.py validate 流程.json [--design 设计稿.md] [--report 报告.md]
 $PY scripts/tccc_flow.py decompile 画布.json -o 设计稿.md [--title 名称]
 $PY scripts/tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
 ```
 
+- `build src`（传目录）：产物路径默认按 **src 的父目录名**取，
+  `<父目录>/<父目录名>-设计稿.md`、`<父目录名>.json`、`<父目录名>-校验报告.md`；同时就地修分片硬折行。
+- `split`：整篇设计稿 → `src/`（默认建在设计稿同级）。目标目录已有 md 时必须 `--force`（会先删旧分片，
+  避免残留已删除的节点）。输入是画布 JSON 时会先 `decompile` 再拆。
+- `assemble`：只合并不编译，用于快速预览整篇效果。
 - `build` 有 error 时不写 JSON（`--force` 可强行写出，仅调试用），退出码 2。
 - `--base`：md 未表达的字段从底座逐字继承；节点按 `- ID:` 匹配，分支 id 消耗式复用。
 - `--rewrap`：合并话术里的排版硬折行。**不带 `--base` 时默认开启**（新建流程），带 `--base` 时默认关闭（改存量画布优先保真）；可用 `--no-rewrap` / `--rewrap` 显式覆盖。

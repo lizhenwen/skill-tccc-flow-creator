@@ -1,6 +1,6 @@
 ---
 name: skill-tccc-flow 
-description: 根据业务需求生成腾讯云呼叫中心 TCCC「AI 画布 / 语音智能体」可导入的流程 JSON（ivrData + voiceSettings），也支持把已导出的画布 JSON 逆编译成 Markdown 设计稿再改回去。当用户要做外呼/呼入话术流程、语音 IVR 流程、AI 画布节点编排、对话节点分支与意图设计、systemPrompt 人设编写，或提到 TCCC 画布、agent-flow、ivrData、chatNode、voiceSettings、导入画布 JSON 时使用。
+description: 根据业务需求生成腾讯云呼叫中心 TCCC「AI 画布 / 语音智能体」可导入的流程 JSON（ivrData + voiceSettings）；设计稿以 src/ 分片形态维护（一个节点一个 md），编译时合并成整篇设计稿 + JSON，也支持把已导出的画布 JSON 逆编译回来改。当用户要做外呼/呼入话术流程、语音 IVR 流程、AI 画布节点编排、对话节点分支与意图设计、systemPrompt 人设编写，或提到 TCCC 画布、agent-flow、ivrData、chatNode、voiceSettings、导入画布 JSON、拆分/合并设计稿时使用。
 description_zh: TCCC AI 画布流程生成
 description_en: Generate TCCC AI-canvas flow JSON
 disable: false
@@ -9,7 +9,8 @@ agent_created: true
 
 # skill-tccc-flow
 
-把业务需求编译成 TCCC AI 画布可直接导入的 JSON。**唯一真源是 Markdown 设计稿**，JSON 由 Python 脚本生成，绝不手写 JSON。
+把业务需求编译成 TCCC AI 画布可直接导入的 JSON。**唯一真源是 `src/` 里的 Markdown 分片**，
+整篇设计稿和 JSON 都是 `build` 出来的产物，绝不手写 JSON、也不直接改合并稿。
 
 ## When to use
 
@@ -20,12 +21,13 @@ agent_created: true
 ## 核心链路
 
 ```
-业务需求 ──▶ ①写 md 设计稿 ──▶ ② build.py 编译 ──▶ 画布 JSON + 校验报告
-                  ▲                                        │
-                  └────── ③ decompile（改存量画布时） ◀──────┘
+业务需求 ──▶ ① 写 src/ 分片（一节点一文件）──▶ ② build src ──▶ 整篇设计稿 md + 画布 JSON + 校验报告 ──▶ 导入画布
+                          ▲
+             ③ 已有整篇 md 或存量画布 JSON：先 decompile / split 成 src/，之后只维护 src/
 ```
 
-一把到底：不中途停下等确认。信息缺失时自行做**合理假设**，并在设计稿的`## 假设与待确认` 表里逐条列出，让用户回头核对。
+一把到底：不中途停下等确认。信息缺失时自行做**合理假设**，并在 `src/` 的
+`## 假设与待确认` 分片里逐条列出，让用户回头核对。
 
 ## 执行步骤
 
@@ -33,16 +35,35 @@ agent_created: true
 
 | 用户给的东西 | 走法 |
 |---|---|
-| 只有业务需求 | 直接写新设计稿（Step 1） |
-| 已有画布 JSON，要改 | 先 `decompile` 成 md，改 md，再 `build --base 原JSON`（Step 3） |
+| 只有业务需求 | 直接建 `src/` 写分片（Step 1） |
+| 目标目录已有 `src/` | 只改要动的那几个分片，再 `build src/`（Step 2） |
+| 已有整篇设计稿 md（历史项目） | 先 `split 设计稿.md -o src`，之后只维护 `src/` |
+| 已有画布 JSON，要改 | `decompile 画布.json -o /tmp/x.md` → `split /tmp/x.md -o src` → 改分片 → `build src --base 原JSON`（Step 3） |
 | 有 JSON 想体检 | 只跑 `validate` |
 
 存量画布只要传了 `--base`，md 里没表达的字段会从原 JSON 逐字继承，节点 id / 分支 id / 词槽 slotId 全部保留，改动范围可控。
 
-### Step 1：写 md 设计稿
+### Step 1：写 src/ 分片
 
-先读 `references/design-doc-spec.md`（语法权威）和 `references/prompt-guide.md`（话术与分支写法）。
-照抄 `assets/example-催件查询.md` 的骨架最省事。
+先读 `references/design-doc-spec.md`（语法权威 + `src/` 目录约定）和
+`references/prompt-guide.md`（话术与分支写法）。照抄 `assets/example-催件查询.md`
+的骨架最省事：写成整篇 md 后 `split` 一下，就得到规范的 `src/`。
+
+```
+<项目目录>/src/
+├── 00-流程信息.md        # `# 流程：xxx` 标题 + 模块进度说明
+├── 10-环境配置.md        # ## 环境配置
+├── 20-假设与待确认.md    # 其它 ## 章节，一章一文件，原样透传
+├── 30-全局提示词/        # systemPrompt 按 `# 人设 / # 任务 / …` 拆片
+├── 40-变量表.md
+└── 50-节点/              # 一个节点一个文件：010-N01-开始通话.md
+```
+
+- **文件名数字前缀 = 合并顺序**，步长留 10，插新节点用中间号（如 `095-N50-xxx.md`），不用重排已有文件。
+- 改动只碰相关分片：调一个节点的话术就只改那一个文件，别动别人。
+- 加新节点 = 新建一个 `50-节点/xxx.md`，内容从 `### Nxx 名称 [kind]` 开始；
+  节点多了可以在 `50-节点/` 下再建子目录按场景分组（如 `500-E4场景/`），仍按数字前缀排序。
+- 别手写合并稿 `xxx-设计稿.md`，它每次 build 都会被覆盖。
 
 设计原则（按优先级）：
 
@@ -69,24 +90,51 @@ agent_created: true
 
 ```bash
 PY=/Users/lizhenwen/.workbuddy/binaries/python/versions/3.13.12/bin/python3
-$PY <skill>/scripts/tccc_flow.py build 设计稿.md -o 流程.json --report 校验报告.md
+cd <项目目录>
+$PY <skill>/scripts/tccc_flow.py build src [--base 上一版.json]
 ```
 
-有 error 时**不会写出 JSON**，按报告里的编码定位修 md 再编译。
+**传目录就一条命令搞定三份产物**，路径按项目目录名自动取（目录 `5881-售后处理流程/`）：
+
+| 产物 | 路径 |
+|---|---|
+| 整篇设计稿（合并稿，给人看/给客户看） | `5881-售后处理流程-设计稿.md` |
+| 画布 JSON（导入用） | `5881-售后处理流程.json` |
+| 校验报告（问题位置带 src 文件名） | `5881-售后处理流程-校验报告.md` |
+
+要改名就显式传 `-o xxx.json` / `--emit-md xxx.md`；只想要 JSON 加 `--no-emit-md`。
+
+有 error 时**不会写出 JSON**，报错会直接给出 `src/50-节点/xxx.md 第 N 行`，按编码定位修那个分片再编译。
 warning 不阻断，但要在最终回复里向用户点明（尤其 W1 环境 id 待补）。
+
+传目录时 `build` 还会把分片里的硬折行**就地修好**（rewrap），所以 src / 合并稿 / JSON 三者永远一致。
 
 ### Step 3：改存量画布
 
 ```bash
-$PY <skill>/scripts/tccc_flow.py decompile 导出的画布.json -o 设计稿.md
-#   改 md …
-$PY <skill>/scripts/tccc_flow.py build 设计稿.md -o 新流程.json --base 导出的画布.json
+$PY <skill>/scripts/tccc_flow.py decompile 导出的画布.json -o /tmp/x.md
+$PY <skill>/scripts/tccc_flow.py split /tmp/x.md -o src      # 拆成分片，之后只维护 src/
+#   改分片 …
+$PY <skill>/scripts/tccc_flow.py build src --base 导出的画布.json
 ```
+
+改存量画布**每次 build 都要带 `--base 上一版.json`**（先 `cp` 一份当底座），
+否则已导入画布的节点 id 会被重算，画布上的人工改动全丢。
 
 ### Step 4：交付
 
-一次落盘三份：`xxx-设计稿.md`、`xxx.json`、`xxx-校验报告.md`，然后 present_files。
+目标目录里应当只有一份设计稿：`src/`（真源）+ 合并稿 md + JSON + 校验报告，然后 present_files。
+历史版本、初版全流程草稿一律挪进 `参考材料/历史版本/`，不要在根目录留第二份设计稿。
 回复里要说清：节点数/连线数、做了哪些假设、哪些环境 id 需要用户补。
+
+## 分模块交付（50+ 节点的大流程）
+
+大流程一次导入没法验证，按模块分期交付，但**始终只有一份 `src/`**：
+
+1. 每期只往 `src/50-节点/` 里加/改本期的节点分片，未开发的场景先统一指向转人工节点。
+2. 期末 `build src --base 上一期.json`：已验证节点的 id 全部保留，本期只验「路由进场景 + 场景内话术」。
+3. 模块进度写在 `src/00-流程信息.md` 的说明里（哪期做完了、哪期还转人工），别再另建 `xxx-M2-设计稿.md`。
+4. 抽检清单/测试记录这类 QA 产物可以按模块命名（`xxx-M1-抽检清单.md`），它们不是设计稿。
 
 ## 红线（违反必翻车，逐条来自画布源码）
 
@@ -115,4 +163,6 @@ $PY <skill>/scripts/tccc_flow.py build 设计稿.md -o 新流程.json --base 导
 
 ## 已验证
 
-对两份真实导出画布做 decompile → build --base 往返：124 节点 / 339 连线与 14 节点 / 17 连线，节点 id、分支 id、全部 outEdges、全部 nodeData 字段 100% 一致，0 error。
+- 对两份真实导出画布做 decompile → build --base 往返：124 节点 / 339 连线与 14 节点 / 17 连线，节点 id、分支 id、全部 outEdges、全部 nodeData 字段 100% 一致，0 error。
+- 三诺售后 61 节点 / 144 连线项目迁到 `src/`：split → assemble 逐字节无损，
+  `build src --base 上一版.json` 产出的 JSON 与迁移前**逐字节一致**；再 split 回去分片内容也完全一致。
