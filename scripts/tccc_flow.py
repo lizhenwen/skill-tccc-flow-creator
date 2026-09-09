@@ -728,38 +728,127 @@ def _parse_conditions(expr: str, ln: int) -> tuple[list[dict[str, Any]], str]:
     return conds, logic
 
 
+# 工作时间判断：dayType 只有这四种，画布导入时用它反查规则类型，
+# 写错（比如 Weekly / Specific）会被整条丢弃，节点变成「未配置」，保存报「请配置工作时间判断」。
+DAY_TYPE_ALIASES = [
+    ("法定工作日", "BusinessDay"), ("工作日", "BusinessDay"),
+    ("法定休息日", "Holiday"), ("节假日", "Holiday"), ("休息日", "Holiday"),
+    ("自定义星期", "Custom"), ("每周", "Custom"), ("星期", "Custom"),
+    ("自定义日期", "CustomDate"), ("指定日期", "CustomDate"), ("日期", "CustomDate"),
+]
+DAY_TYPE_ZH = {"BusinessDay": "法定工作日", "Holiday": "法定休息日",
+               "Custom": "自定义星期", "CustomDate": "自定义日期"}
+# 只有大陆时区能用法定工作日/法定休息日（画布 checkIsMainlandChinaTZ）
+MAINLAND_CHINA_TIME_ZONES = {"Asia/Shanghai", "Asia/Chongqing", "Asia/Chungking",
+                             "Asia/Harbin", "Asia/Urumqi", "PRC"}
+WEEKDAY_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7}
+WEEKDAY_ZH = {1: "周一", 2: "周二", 3: "周三", 4: "周四", 5: "周五", 6: "周六", 7: "周日"}
+_WD = r"(?:周|星期|礼拜)"
+WEEKDAY_RANGE = re.compile(rf"{_WD}([一二三四五六日天])\s*[-~～到至]\s*{_WD}?([一二三四五六日天])")
+WEEKDAY_ONE = re.compile(rf"{_WD}([一二三四五六日天])")
+WEEKEND = re.compile(rf"{_WD}末")
+_DATE = r"\d{4}-\d{1,2}-\d{1,2}"
+DATE_RANGE = re.compile(rf"({_DATE})\s*[-~～到至]\s*({_DATE})")
+DATE_ONE = re.compile(_DATE)
+TIME_PERIOD = re.compile(
+    r"(\d{1,2})[:：](\d{2})\s*[-~～到至]\s*(次日|次天|第二天)?\s*(\d{1,2})[:：](\d{2})")
+
+
+def _parse_weekdays(seg: str) -> list[int]:
+    """周一、周三 / 周一~周五 / 周末 → [1,3] / [1,2,3,4,5] / [6,7]，星期几用 1-7（周日=7）。"""
+    days: set[int] = set()
+    if WEEKEND.search(seg):
+        days.update((6, 7))
+    rest = WEEKEND.sub(" ", seg)
+    for m in WEEKDAY_RANGE.finditer(rest):
+        a, b = WEEKDAY_NUM[m.group(1)], WEEKDAY_NUM[m.group(2)]
+        days.update(range(a, b + 1) if a <= b else list(range(a, 8)) + list(range(1, b + 1)))
+    rest = WEEKDAY_RANGE.sub(" ", rest)
+    for m in WEEKDAY_ONE.finditer(rest):
+        days.add(WEEKDAY_NUM[m.group(1)])
+    return sorted(days)
+
+
+def _norm_date(s: str) -> str:
+    y, m, d = s.split("-")
+    return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+
+
+def _parse_date_ranges(seg: str) -> list[dict[str, str]]:
+    """2026-01-01 / 2026-01-01~2026-01-03 → [{startDate, endDate}]。"""
+    out: list[dict[str, str]] = []
+    for m in DATE_RANGE.finditer(seg):
+        a, b = _norm_date(m.group(1)), _norm_date(m.group(2))
+        out.append({"startDate": min(a, b), "endDate": max(a, b)})
+    rest = DATE_RANGE.sub(" ", seg)
+    for m in DATE_ONE.finditer(rest):
+        d = _norm_date(m.group(0))
+        out.append({"startDate": d, "endDate": d})
+    return out
+
+
+def _parse_periods(seg: str, ln: int) -> list[dict[str, Any]]:
+    periods: list[dict[str, Any]] = []
+    for pm in TIME_PERIOD.finditer(seg):
+        sh, sm = int(pm.group(1)), int(pm.group(2))
+        eh, em = int(pm.group(4)), int(pm.group(5))
+        # 画布只按「结束早于开始」判定跨天，这里保持同一口径，写 26:00 或「次日02:00」都归一到 2:00
+        cross = bool(pm.group(3)) or eh >= 24
+        eh %= 24
+        if not cross and (eh, em) < (sh, sm):
+            cross = True
+        if not (0 <= sh <= 23 and 0 <= sm <= 59 and 0 <= em <= 59):
+            raise DesignError(f"第 {ln} 行：时段 {pm.group(0)} 不是合法时间")
+        periods.append({
+            "startTime": {"hour": sh, "minute": sm, "nextDay": False},
+            "endTime": {"hour": eh, "minute": em, "nextDay": cross},
+        })
+    return periods
+
+
 def _parse_worktime(c: str, ln: int) -> tuple[str, list[dict[str, Any]]]:
-    """解析：工作时间: 工作日 08:00-21:00; 节假日 08:00-21:00"""
+    """解析：工作时间: 法定工作日 08:00-21:00; 自定义星期 周一~周五 09:00-18:00"""
     if ":" in c or "：" in c:
         name, spec = re.split(r"[:：]", c, maxsplit=1)
     else:
         name, spec = c, ""
     name = name.strip() or "工作时间"
     cfgs: list[dict[str, Any]] = []
-    day_map = {"工作日": "BusinessDay", "节假日": "Holiday", "每周": "Weekly", "指定日期": "Specific"}
+    seen: set[str] = set()
     for seg in [x for x in re.split(r"[;；]", spec) if x.strip()]:
         seg = seg.strip()
         day_type = "BusinessDay"
-        for zh, en in day_map.items():
+        for zh, en in DAY_TYPE_ALIASES:
             if seg.startswith(zh):
-                day_type = en
-                seg = seg[len(zh):].strip()
+                day_type, seg = en, seg[len(zh):].strip()
                 break
-        periods = []
-        for pm in re.finditer(r"(\d{1,2})[:：](\d{2})\s*[-~到至]\s*(\d{1,2})[:：](\d{2})", seg):
-            sh, sm, eh, em = (int(g) for g in pm.groups())
-            periods.append({
-                "startTime": {"hour": sh, "minute": sm, "nextDay": False},
-                "endTime": {"hour": eh % 24, "minute": em, "nextDay": eh >= 24},
-            })
+        if day_type in seen:
+            raise DesignError(
+                f"第 {ln} 行：同一个工作时间分支里「{DAY_TYPE_ZH[day_type]}」写了两次，"
+                f"画布按类型合并，后一条会覆盖前一条；请合并成一条（多个时段用空格分隔）")
+        seen.add(day_type)
+        periods = _parse_periods(seg, ln)
         if not periods:
             raise DesignError(f"第 {ln} 行：工作时间分支缺少时段（形如 08:00-21:00）")
-        cfgs.append({
+        cfg: dict[str, Any] = {
             "dayType": day_type, "daysOfWeek": [], "specificDates": [],
             "workTimePeriods": periods,
-        })
+        }
+        if day_type == "Custom":
+            cfg["daysOfWeek"] = _parse_weekdays(seg)
+            if not cfg["daysOfWeek"]:
+                raise DesignError(
+                    f"第 {ln} 行：「自定义星期」必须写明星期几，如「自定义星期 周一~周五 09:00-18:00」")
+        elif day_type == "CustomDate":
+            cfg["specificDates"] = _parse_date_ranges(seg)
+            if not cfg["specificDates"]:
+                raise DesignError(
+                    f"第 {ln} 行：「自定义日期」必须写明日期，如"
+                    f"「自定义日期 2026-01-01~2026-01-03 09:00-18:00」")
+        cfgs.append(cfg)
     if not cfgs:
-        raise DesignError(f"第 {ln} 行：工作时间分支需写明时段，如「工作时间: 工作日 08:00-21:00 → N05」")
+        raise DesignError(
+            f"第 {ln} 行：工作时间分支需写明时段，如「工作时间: 法定工作日 08:00-21:00 → N05」")
     return name, cfgs
 
 
@@ -1560,6 +1649,47 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
                         f"分支「{b.get('name') or b.get('content') or b.get('id')}」没有连线，"
                         f"这类节点不允许悬空分支")
 
+        # E16 工作时间配置：dayType 写错或缺 daysOfWeek/specificDates，
+        # 导入时整条规则会被静默丢弃，节点退回「未配置」，保存报「请配置工作时间判断」
+        if typ == "workTimeNode":
+            wtb = nd.get("workTimeBranches") or []
+            if not [b for b in wtb if b.get("type") == "other"]:
+                add("error", "E16", name, "缺少 type=other 的「其他时间」分支")
+            for b in wtb:
+                if b.get("type") == "other":
+                    continue
+                bn = b.get("name") or b.get("id")
+                cfgs = b.get("workTimeConfigs") or []
+                if not cfgs:
+                    add("error", "E16", name, f"分支「{bn}」没有任何时间规则")
+                types_seen: set[str] = set()
+                for c in cfgs:
+                    dt = c.get("dayType")
+                    if dt not in DAY_TYPE_ZH:
+                        add("error", "E16", name,
+                            f"分支「{bn}」的 dayType={dt!r} 非法，只能是 "
+                            f"{'/'.join(DAY_TYPE_ZH)}")
+                        continue
+                    if dt in types_seen:
+                        add("error", "E16", name, f"分支「{bn}」重复配置了 {dt}，画布只会保留最后一条")
+                    types_seen.add(dt)
+                    if not (c.get("workTimePeriods") or []):
+                        add("error", "E16", name, f"分支「{bn}」的 {dt} 规则没有时段")
+                    if dt == "Custom" and not (c.get("daysOfWeek") or []):
+                        add("error", "E16", name, f"分支「{bn}」的 Custom 规则缺 daysOfWeek（1-7，周日=7）")
+                    if dt == "CustomDate" and not (c.get("specificDates") or []):
+                        add("error", "E16", name,
+                            f"分支「{bn}」的 CustomDate 规则缺 specificDates（[{{startDate,endDate}}]）")
+            tz = str(nd.get("timeZoneName") or "")
+            if not tz:
+                add("error", "E16", name, "timeZoneName 为空，保存会报「请选择时区」")
+            elif tz not in MAINLAND_CHINA_TIME_ZONES and any(
+                    c.get("dayType") in ("BusinessDay", "Holiday")
+                    for b in (nd.get("workTimeBranches") or [])
+                    for c in (b.get("workTimeConfigs") or [])):
+                add("error", "E16", name,
+                    f"时区 {tz} 非中国大陆，不支持法定工作日/法定休息日（BusinessDay/Holiday）")
+
         # E10 对话节点收集变量
         if typ == "chatNode":
             ents = nd.get("entities") or []
@@ -1798,7 +1928,7 @@ TYPE_TO_KIND = {
     "logicSplitNode": "condition", "workTimeNode": "worktime", "hangup": "end",
     "transferAgentNode": "transfer-agent",
 }
-DAY_ZH = {"BusinessDay": "工作日", "Holiday": "节假日", "Weekly": "每周", "Specific": "指定日期"}
+DAY_ZH = DAY_TYPE_ZH
 
 
 def _kind_of(node: dict[str, Any]) -> str:
@@ -2035,11 +2165,22 @@ def _decompile_branches(kind: str, n: dict[str, Any], no_of: dict[str, str],
             else:
                 segs = []
                 for c in b.get("workTimeConfigs") or []:
-                    ps = "、".join(
+                    ps = " ".join(
                         f"{p['startTime']['hour']:02d}:{p['startTime']['minute']:02d}-"
-                        f"{p['endTime']['hour']:02d}:{p['endTime']['minute']:02d}"
+                        + ("次日" if (p.get("endTime") or {}).get("nextDay") else "")
+                        + f"{p['endTime']['hour']:02d}:{p['endTime']['minute']:02d}"
                         for p in c.get("workTimePeriods") or [])
-                    segs.append(f"{DAY_ZH.get(c.get('dayType'), '工作日')} {ps}")
+                    dt = c.get("dayType")
+                    qual = ""
+                    if dt == "Custom":
+                        qual = "、".join(WEEKDAY_ZH.get(d, str(d))
+                                        for d in c.get("daysOfWeek") or []) + " "
+                    elif dt == "CustomDate":
+                        qual = "、".join(
+                            r.get("startDate", "") if r.get("startDate") == r.get("endDate")
+                            else f"{r.get('startDate', '')}~{r.get('endDate', '')}"
+                            for r in c.get("specificDates") or []) + " "
+                    segs.append(f"{DAY_ZH.get(dt, '法定工作日')} {qual}{ps}")
                 out.append(f"- {b.get('name') or '工作时间'}: {'; '.join(segs)}{arrow(b.get('id'))}")
     else:
         for b in nd.get("branches") or []:

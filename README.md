@@ -270,6 +270,7 @@ tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
 | E13 | 单出口节点不能连自己 |
 | E14 | `selectBranch=true` 的对话节点必须有分支 |
 | E15 | `contentType` 只能是 `gen` 或 `fix` |
+| E16 | 工时判断的 `dayType` 只能是 `BusinessDay`/`Holiday`/`Custom`/`CustomDate`；`Custom` 必须带 `daysOfWeek`，`CustomDate` 必须带 `specificDates`；必须有「其他时间」兜底分支；非大陆时区不能用法定工作日/休息日 |
 | W1 | 环境相关 id 待补（技能组 / 智能体 / 接口 URL / 音色） |
 | W2 | 单节点分支数 > 12，意图识别精度会下降 |
 | W3 | 全局节点超过 3 个，会污染所有节点的意图识别 |

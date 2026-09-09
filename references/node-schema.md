@@ -203,17 +203,37 @@
   "globalNode": false,
   "workTimeBranches": [
     { "id": "relation-…", "type": "worktime", "name": "工作时间1",
-      "workTimeConfigs": [{
-        "dayType": "BusinessDay",        // BusinessDay/Holiday/Weekly/Specific
-        "daysOfWeek": [], "specificDates": [],
-        "workTimePeriods": [{ "startTime": {"hour":8,"minute":0,"nextDay":false},
-                              "endTime": {"hour":21,"minute":0,"nextDay":false} }]
-      }] },
+      "workTimeConfigs": [
+        { "dayType": "BusinessDay", "daysOfWeek": [], "specificDates": [],
+          "workTimePeriods": [{ "startTime": {"hour":8,"minute":30,"nextDay":false},
+                                "endTime": {"hour":18,"minute":0,"nextDay":false} }] },
+        { "dayType": "Custom", "daysOfWeek": [1,2,3,4,5], "specificDates": [],
+          "workTimePeriods": [{ "startTime": {"hour":9,"minute":0,"nextDay":false},
+                                "endTime": {"hour":18,"minute":0,"nextDay":false} }] },
+        { "dayType": "CustomDate", "daysOfWeek": [],
+          "specificDates": [{ "startDate": "2026-09-09", "endDate": "2026-09-09" }],
+          "workTimePeriods": [{ "startTime": {"hour":9,"minute":0,"nextDay":false},
+                                "endTime": {"hour":18,"minute":0,"nextDay":false} }] }
+      ] },
     { "id": "relation-…", "type": "other", "name": "其他时间", "workTimeConfigs": [] }
   ],
   "branches": []
 }
 ```
+
+- `dayType` **只有** `BusinessDay`（法定工作日）/ `Holiday`（法定休息日）/ `Custom`（自定义星期）/
+  `CustomDate`（自定义日期）四种。写别的值（曾误写过 `Weekly` / `Specific`）会在
+  `DAY_TYPE_WORK_TIME_RULE_MAP` 查不到，导入时整条规则被静默丢弃，节点退回「未配置」，
+  保存报「请配置工作时间判断」。
+- `Custom` 必须给非空 `daysOfWeek`（1=周一 … 7=周日）；`CustomDate` 必须给非空
+  `specificDates`（`{startDate, endDate}`，同一天则两者相同）。缺了同样保存不过。
+- 同一个分支里每种 `dayType` 最多出现一次，画布按类型收敛，重复的后者覆盖前者。
+- `startTime.nextDay` 恒为 `false`；`endTime.nextDay` 表示跨天。画布导入时其实会用
+  「结束早于开始」重新推导，写反了不会报错但会与预期不符。
+- `BusinessDay` / `Holiday` 依赖中国大陆法定节假日历，`timeZoneName` 不在
+  `Asia/Shanghai / Asia/Chongqing / Asia/Chungking / Asia/Harbin / Asia/Urumqi / PRC`
+  之内时保存会报「非中国大陆时区不支持选择法定工作日或法定休息日」。
+- 必须有一条 `type: "other"` 的「其他时间」分支兜底，且每条分支都要连线。
 
 ## DTMFNode.nodeData
 
