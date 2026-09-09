@@ -2058,15 +2058,14 @@ def _decompile_branches(kind: str, n: dict[str, Any], no_of: dict[str, str],
 #   ├── 00-流程信息.md        # `# 流程：xxx` 标题 + 模块说明
 #   ├── 10-环境配置.md        # ## 环境配置
 #   ├── 20-假设与待确认.md    # 任意其它 ## 章节，一章一文件，原样透传
-#   ├── 30-全局提示词/        # systemPrompt 按 `# 段落` 拆片
-#   │   ├── 10-人设.md
-#   │   └── 20-任务.md
+#   ├── 30-全局提示词.md      # ## 全局提示词，整篇一个文件（systemPrompt 本来就是一整块）
 #   ├── 40-变量表.md
 #   └── 50-节点/              # 一个节点一个文件，可再用子目录分组
 #       ├── 010-N01-开始通话.md
 #       └── 020-N02-开场问题识别.md
 #
-# 目录角色靠目录名识别（节点/nodes、全局提示词/prompt），认不出来时嗅探首行是不是
+# 只有节点是拆片的（几十上百个），章节一律一章一文件。目录角色靠目录名识别
+# （节点/nodes；全局提示词/prompt 目录仅为兼容手工拆片保留），认不出来时嗅探首行是不是
 # `### Nxx …`。合并 = 按序拼接，不做任何语义加工，所以 split → assemble 是无损往返。
 # ============================================================================
 
@@ -2076,7 +2075,6 @@ SEQ_PREFIX_RE = re.compile(r"^(\d+)\s*[-_.]?\s*")
 NODES_DIR_ALIASES = {"节点", "nodes", "node"}
 PROMPT_DIR_ALIASES = {"全局提示词", "prompt", "prompts", "systemprompt", "system-prompt"}
 FNAME_BAD_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff_]+")
-SECTION_PROMPT_RE = re.compile(r"^(全局提示词|systemPrompt)", re.I)
 
 
 def _safe_name(s: str, limit: int = 32) -> str:
@@ -2219,33 +2217,6 @@ def src_file_of_line(origin: list[tuple[Path | None, int]], line: int) -> Path |
     return origin[line - 1][0] if 1 <= line <= len(origin) else None
 
 
-def _split_prompt(prompt: str) -> list[tuple[str, str]]:
-    """systemPrompt 按顶层 `# 段落` 拆片。"""
-    body = prompt.strip("\n")
-    if not body.strip():
-        return [("10-全局提示词.md", "\n")]
-    frags: list[tuple[str, list[str]]] = []
-    cur: tuple[str, list[str]] | None = None
-    pre: list[str] = []
-    for raw in body.split("\n"):
-        if raw.startswith("# "):
-            if cur:
-                frags.append(cur)
-            cur = (raw[2:].strip(), [raw])
-            continue
-        (cur[1] if cur else pre).append(raw)
-    if cur:
-        frags.append(cur)
-    out: list[tuple[str, str]] = []
-    seq = 0
-    if [x for x in pre if x.strip()]:
-        out.append(("05-开头.md", "\n".join(pre).strip("\n") + "\n"))
-    for name, lines in frags:
-        seq += 10
-        out.append((f"{seq:02d}-{_safe_name(name)}.md", "\n".join(lines).strip("\n") + "\n"))
-    return out or [("10-全局提示词.md", body + "\n")]
-
-
 def _split_nodes(body: list[str]) -> list[tuple[str, str]]:
     """`## 节点` 章节按 `### Nxx 名称 [kind]` 拆片，一个节点一个文件。"""
     chunks: list[tuple[str, str, list[str]]] = []
@@ -2314,10 +2285,7 @@ def split_design(text: str) -> list[tuple[str, str]]:
     for title, body in sections:
         seq += 10
         t = title.replace(" ", "")
-        if SECTION_PROMPT_RE.match(t):
-            d = f"{seq:02d}-全局提示词"
-            files += [(f"{d}/{n}", c) for n, c in _split_prompt(_extract_fence(body))]
-        elif t.startswith("节点"):
+        if t.startswith("节点"):
             d = f"{seq:02d}-节点"
             files += [(f"{d}/{n}", c) for n, c in _split_nodes(body)]
         else:
