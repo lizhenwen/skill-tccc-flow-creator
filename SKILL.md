@@ -1,5 +1,8 @@
 ---
 name: skill-tccc-flow 
+version: 0.7.0
+display_name: TCCC AI 画布生成
+display_name_en: TCCC AI-canvas flow
 description: 根据业务需求生成腾讯云呼叫中心 TCCC「AI 画布 / 语音智能体」可导入的流程 JSON（ivrData + voiceSettings）；设计稿以 src/ 分片形态维护（一个节点一个 md），编译时合并成整篇设计稿 + JSON，也支持把已导出的画布 JSON 逆编译回来改。当用户要做外呼/呼入话术流程、语音 IVR 流程、AI 画布节点编排、对话节点分支与意图设计、systemPrompt 人设编写，或提到 TCCC 画布、agent-flow、ivrData、chatNode、voiceSettings、导入画布 JSON、拆分/合并设计稿时使用。
 description_zh: TCCC AI 画布流程生成
 description_en: Generate TCCC AI-canvas flow JSON
