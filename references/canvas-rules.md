@@ -101,6 +101,7 @@ type 名映射（`transformToFlowData` 的 switch，`:1741-2369`）：
 - `syncConversationSlotsBeforeSave()`：调 `/tcccadmin/aislot/getAISlotList` 拉取，`/tcccadmin/aislot/updateAISlot` 创建/更新并回填 `slotId`（`:136-199`）。
 - 临时 id → 真实 slotId 的替换：`idMap[String(collectionConfig.collectionType)]`（`:83-98`），所以 `entity.id` 和 `collectionConfig.collectionType` 必须写成**同一个临时 id**。
 - 填了假的 `slotId` + `slotType` → 不会触发同步，前端不报错，**运行时指向不存在的词槽**。
+- 本工具只同步 `slotType=custom`。不要写 date/name 等字面量：TCCC aislot 接口不接受这些 type，`collectionType` 也不会指向账号词槽目录。
 
 ## 其它上限
 

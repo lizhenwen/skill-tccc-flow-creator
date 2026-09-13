@@ -115,21 +115,21 @@
 
 ```json
 "entities": [{
-  "slotType": "custom",          // 内置：date/time/datetime/address/surname/name/original_words
+  "slotType": "custom",          // 只写 custom
   "varName": "运单号",            // 收集结果存进这个变量
   "name": "运单号",               // 词槽名
   "description": "提取 13-15 位连续数字…",
-  "id": "entity-<uuid>"          // 自定义词槽的前端临时 id（无 slotId 时才写）
+  "id": "entity-<uuid>"          // 无 slotId 时的前端临时 id
 }],
 "collectionConfig": {
-  "collectionType": "entity-<uuid>",   // 内置词槽写类型字面量如 "date"；自定义写 slotId 或临时 id
+  "collectionType": "entity-<uuid>",   // slotId 或临时 id，不要写 date/name 等字面量
   "collectionAsValue": "运单号",
   "collectionItems": [{ "id": "relation-<uuid>", "collectionType": "…", "collectionAsValue": "运单号" }]
 }
 ```
 
 - `slotId` 是**账号维度的服务端词槽主键**。不填 → 保存时 `syncConversationSlots`自动建槽并把临时 id 换成真实 slotId。**伪造 slotId 前端不报错，运行时指向不存在的词槽。**
-- 内置词槽的 `collectionType` 用类型字面量（`date`），不是 slotId。
+- `slotType` 只使用 `custom`。`collectionType` 写 slotId 或临时 id，不要写类型字面量。
 - 有 `entities` 时 `replyMode` 必须是 `intent_with_entity`，且必须有 `entity_success` 分支。
 - 一个节点只能有一个 entity。
 

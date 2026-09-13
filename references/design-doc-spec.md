@@ -166,7 +166,7 @@
 | 静默等待(秒) | 不写则不落字段 | 写了才会出现 `silentWaitTime` |
 | 听用户回复 | 有分支即 true | 一般不用手写，`announce` 恒为 false |
 | 收集变量 | —— | 一个节点最多一个（画布限制） |
-| 词槽类型 | custom | 内置：date/time/datetime/address/surname/name/original_words；其余算自定义 |
+| 词槽类型 | custom | 只写 custom，可省略。不要写 date/name 等；写了也会强制按 custom 处理（W14） |
 | 词槽ID | —— | **仅在复用真实环境已存在的词槽时写**，新建流程绝不要编 |
 | 词槽名称 / 词槽说明 | 同变量名 / 空 | 说明里的换行写 `\n` 字面量 |
 | 收集方式 | 不写则不落字段 | 开放 / 固定选项 |

@@ -33,9 +33,6 @@ VERSION = "1.0"
 SYSTEM_PROMPT_MAX = 8192  # persona-requirements.vue:130
 VALID_VAD_LEVELS = {0, 1, 2, 3, 100}
 BUILTIN_VARS = {"StaffNo", "SessionId"}
-BUILTIN_SLOT_TYPES = {
-    "date", "time", "datetime", "address", "surname", "name", "original_words",
-}
 
 DEFAULT_TRANSFER_MUSIC = (
     "CgAAADE0MDAwMzcwMjULAAAAc3dpdGNoYm9hcmQ7AAAAMTQwMDAzNzAyNV9zd2l0Y2hib2"
@@ -1265,7 +1262,6 @@ def _node_data(n: Node, d: Design, nid: str,
     if k in ("chat", "announce"):
         listens = _listens(n)
         var = n.a("收集变量")
-        slot_type = n.a("词槽类型", "custom")
         content_mode = n.a("话术模式", "固定" if k == "announce" else "智能生成")
         data: dict[str, Any] = {
             "welcomeText": n.prompt,
@@ -1284,15 +1280,13 @@ def _node_data(n: Node, d: Design, nid: str,
             data["silentWaitTime"] = n.aint("静默等待(秒)", 10)
         if var:
             slot_id = n.a("词槽ID")
-            is_builtin = slot_type in BUILTIN_SLOT_TYPES
-            if is_builtin:
-                ctype = slot_type                      # date / address / name ...
-            elif slot_id:
-                ctype = str(slot_id)                   # 已存在的自定义词槽
+            # 词槽目录只认 custom。原稿即使写了 date/name，这里也强制 custom，并给出临时 id 以便发布建槽。
+            if slot_id:
+                ctype = str(slot_id)
             else:
-                ctype = entity_tmp_id_of(n.key, var)   # 待建槽的临时 id
+                ctype = entity_tmp_id_of(n.key, var)
             ent: dict[str, Any] = {
-                "slotType": slot_type if (is_builtin or slot_id) else "custom",
+                "slotType": "custom",
                 "varName": var,
                 "name": n.a("词槽名称", var) or var,
                 "description": _unesc(n.a("词槽说明", "") or ""),
@@ -1307,8 +1301,8 @@ def _node_data(n: Node, d: Design, nid: str,
                 except ValueError:
                     ent["slotId"] = slot_id
                 ent = {"slotId": ent["slotId"], **{k: v for k, v in ent.items() if k != "slotId"}}
-            elif not is_builtin:
-                # 前端临时 id：保存时 syncConversationSlots 会建槽并回填 slotId
+            else:
+                # 前端临时 id：发布/保存时会建槽并回填真实 slotId
                 ent["id"] = ctype
             if ent.get("collectionMode") == "fixed" and n.a("固定选项"):
                 ent["fixedOptions"] = n.a("固定选项")
@@ -1841,6 +1835,10 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
     # 话术三段结构
     if design:
         for nd_ in design.nodes:
+            st = (nd_.a("词槽类型") or "").strip()
+            if nd_.a("收集变量") and st and st != "custom":
+                add("warn", "W14", nd_.key,
+                    f"词槽类型只支持 custom，已按 custom 处理（原稿是 {st!r}）")
             if nd_.kind == "chat" and nd_.prompt:
                 miss = [s for s in ("目标", "参考示例", "应对策略") if s not in nd_.prompt]
                 if miss:
@@ -2057,7 +2055,7 @@ def _decompile_attrs(kind: str, nd: dict[str, Any]) -> list[str]:
             a.append("- 校验实体: 是")
         for e in nd.get("entities") or []:
             a.append(f"- 收集变量: {e.get('varName', '')}")
-            a.append(f"- 词槽类型: {e.get('slotType') or 'custom'}")
+            a.append("- 词槽类型: custom")
             if e.get("slotId") is not None:
                 a.append(f"- 词槽ID: {e['slotId']}")
             if e.get("name"):

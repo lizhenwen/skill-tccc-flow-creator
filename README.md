@@ -282,6 +282,7 @@ tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
 | W9 | `systemPrompt` 长度接近 8192 上限 |
 | W10 | `systemPrompt` 里引用了流程内部变量（词槽/接口/赋值产生），应挪到对应节点话术 |
 | W11 | 话术里「一句话没写完就换行」，排版换行会原样进 JSON 发给大模型（build 默认自动合并） |
+| W14 | 词槽类型只支持 custom，已按 custom 处理 |
 
 报告末尾还会附一份「导入后人工验收清单」。
 
@@ -403,6 +404,10 @@ decompile 会把原 id 写成 `- ID:` 属性，`--base` 靠它精确匹配。
 **Q：词槽要不要填 slotId？**新建流程**不要填**。自定义词槽会写一个临时 id，保存时画布调 `updateAISlot` 自动建槽并回填真实 slotId。
 只有在复用真实环境已存在的词槽时（通常来自 decompile）才会带 `- 词槽ID:`。
 
+**Q：词槽类型写什么？**只写 `custom`（可省略）。不要写 date/name 等：账号词槽目录不认这些 type，发布时也同步不上去。
+
+**Q：词槽类型写什么？**只写 `custom`（可省略）。不要写 date/name 等：账号词槽目录不认这些 type，发布时也同步不上去。
+
 **Q：话术里一句话被断成两行会怎样？**
 围栏内容是逐字写进 JSON 的，排版换行会变成真实 `\n`，等于把断句发给大模型，弱化语义连贯（断在 `${变量}` 或引号附近更容易误解）。`build` 不带 `--base` 时会自动合并并打印「[整形] 合并了 N 处」；已有文件可以 `tccc_flow.py rewrap 目录` 批量修，加 `--dry-run` 先看要改哪些。判定很保守：只有「上一行没说完 + 下一行是续写」才合并，标题、表格、代码块、列表标记、`字段名：值` 清单行、对话示例（`客户：`）一律不动。
 
@@ -421,7 +426,6 @@ decompile 会把原 id 写成 `- ID:` 属性，`--base` 靠它精确匹配。
 | `DEFAULT_VOICE_SETTINGS` | 画布 `voiceSettings` 默认值 |
 | `SYSTEM_PROMPT_MAX` | `persona-requirements.vue` 的 `MAX_PROMPT_LENGTH` |
 | `VALID_VAD_LEVELS` | `validateXGraph.ts` 的 vadLevel 校验 |
-| `BUILTIN_SLOT_TYPES` | `CollectionType` 枚举 |
 | `SYSTEM_BRANCH_TYPES` | `VoiceReplyType` 枚举 |
 | `DEFAULT_TRANSFER_MUSIC` / `DEFAULT_AI_TRANSFER_CONTEXT` | `node/TCCC.ts` 的转接节点默认值 |
 | 节点高度常量（`LABEL_H` / `WELCOME_H` / `BRANCH_ITEM_H` / `GLOBAL_TIPS_H` …）与 `estimate_node_height()` | `flow/utils/manualLayoutNodeSizeEstimate.ts`（画布「一键整理」的几何估算器）；样式改了这里必须同步，否则自动布局会重叠 |
