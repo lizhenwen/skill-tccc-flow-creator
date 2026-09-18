@@ -105,4 +105,24 @@ type 名映射（`transformToFlowData` 的 switch，`:1741-2369`）：
 
 ## 其它上限
 
-- `systemPrompt` 上限 8192，超长静默 `substring` 截断（`agent-flow/src/components/.../persona-requirements.vue:130-132`）。
+画布输入框的 `maxlength` / 截断都是**静默**的：导入不报错、保存不报错，运行时才发现话术被砍了半句。
+所以这几条只能在编译期拦（校验 E12 超限阻断 / W9 到 90% 预警）：
+
+| 内容 | 上限（字） | JSON 字段 | 出处（`agent-flow/src/`） |
+|---|---|---|---|
+| 全局提示词 | 8192 | `voiceSettings.systemPrompt` | `components/voice-node/voice-start-settings/persona-requirements/persona-requirements.vue:130`：`MAX_PROMPT_LENGTH`，`value.substring(0, 8192)` |
+| 兜底固定话术 | 8192 | `voiceSettings.fallbackFixMessage` | 同上（走同一个 `limitPersonaContent`） |
+| 对话 / 播报节点话术 | 5000 | `chatNode.nodeData.content`（`welcomeText` 同值） | `utils/const.ts:237` `MAX_WELCOME_LENGTH` → `voice-conversation-node-component.vue:26` |
+| 单条用户回复分类 | 300 | `branches[].content`（`intent` / `global_intent`） | `utils/const.ts:236` `MAX_REPLY_LENGTH` → `voice-conversation-settings/reply-classification.vue:43` |
+| 词槽说明 / 词槽名 | 1000 / 50 | `entities[].description` / `entities[].name` | `voice-conversation-settings/entity-management-modal.vue:50` / `:37`（固定选项 `fixedOptions` 是 50000） |
+| 赋值变量的提取描述、固定值 / 变量名 | 1000 / 50 | `extractVariableNode.nodeData.vars[].description`、`.value` / `.name` | `voice-variable-assign-node/voice-variable-assign-node.validation.ts:11-12`。**这几条是保存硬拦**，报「提取描述长度不能超过 1000 个字符」「固定赋值长度不能超过 1000 个字符」「变量名称不能为空，且长度不能超过 50 个字符」 |
+| 播报类短文本 | 300 | 转接节点 `transferring-sound` / `transfer-timeout-music` / `transfer-error` / `broadcast-sound`；DTMF `dtmfConfig.play_sound` / `invalid_sound` / `timeout_sound` | `voice-transfer-node-component.vue:206,229,251`、`voice-dtmf-node-component.vue:10,161,180` |
+| 语音留言话术 | 300 | `voiceSettings.voicemailMessage` | `voice-start-settings/voicemail-settings.vue:36` |
+| 静默提示 / 挂机话术 | 100 | `voiceSettings.notifyMessage` / `hungUpMessage` | `voice-start-settings/no-response-settings.vue:64` / `:101` |
+
+- 字数按**字符数**算（回复分类是 `Array.from(content).length`，即码点数，与 Python `len()` 一致）。
+  换行、空格、`${变量名}` 的字面量都计入；`${}` 按原文长度计，不是运行时替换后的长度。
+- 播报类字段的值可能是 `tts:<文本>`，也可能是音频 base64。`tts:` 前缀不计入 300，
+  音频 base64 不受这条限制（校验只量 `tts:` 开头的值）。
+- 导入期不校验长度（见上文「导入期：几乎不校验」），**"导入成功"不等于没超限**，
+  超长内容要么在画布里编辑该字段时被 `maxlength` 砍掉，要么运行时按截断后的内容执行。

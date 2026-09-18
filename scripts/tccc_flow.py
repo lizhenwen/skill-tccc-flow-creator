@@ -30,7 +30,16 @@ from typing import Any
 # ============================================================================
 
 VERSION = "1.0"
-SYSTEM_PROMPT_MAX = 8192  # persona-requirements.vue:130
+# 画布输入框的字数上限。除赋值节点（保存时有明确报错）外都是静默截断，
+# 导入不报错、保存不报错，只能编译期拦。数值全部来自画布源码，勿凭记忆改。
+SYSTEM_PROMPT_MAX = 8192   # 全局提示词 / 兜底固定话术（persona-requirements.vue:130 substring 截断）
+CHAT_PROMPT_MAX = 5000     # 对话节点话术 nodeData.content（const.ts:237 MAX_WELCOME_LENGTH）
+REPLY_CLASS_MAX = 300      # 用户回复分类 branches[].content（const.ts:236 MAX_REPLY_LENGTH）
+VAR_DESC_MAX = 1000        # 变量描述：词槽说明、赋值变量的提取描述/固定值（assign 节点保存时硬拦）
+VAR_NAME_MAX = 50          # 变量名 / 词槽名
+TTS_TEXT_MAX = 300         # 播报类短文本：转接提示音、超时/失败话术、DTMF 各段话术、留言话术
+NOTIFY_TEXT_MAX = 100      # 静默提示 / 挂机话术（no-response-settings.vue:64,101）
+NEAR_LIMIT_RATIO = 0.9     # 超过上限这个比例就提前预警（W9）
 VALID_VAD_LEVELS = {0, 1, 2, 3, 100}
 BUILTIN_VARS = {"StaffNo", "SessionId"}
 
@@ -254,6 +263,7 @@ class Design:
     passthrough: list[tuple[str, str]] = field(default_factory=list)  # (section 标题, 原文)
     injected_vars: list[str] = field(default_factory=list)
     rewrap_stats: int = 0            # build 时合并掉的硬折行数量
+    system_prompt_line: int = 0      # 「## 全局提示词」所在行，用于把校验问题指回 src 分片
 
     @property
     def by_no(self) -> dict[str, Node]:
@@ -450,6 +460,7 @@ def parse_design(text: str) -> Design:
             _parse_env(d, body, start)
         elif t.startswith("全局提示词") or t.startswith("systemPrompt"):
             d.system_prompt = _extract_fence(body).strip()
+            d.system_prompt_line = start
         elif t.startswith("节点"):
             _parse_nodes(d, body, start)
             saw_nodes = True
@@ -1550,6 +1561,20 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
     def add(lv: str, code: str, where: str, msg: str) -> None:
         out.append(Issue(lv, code, where, msg))
 
+    def check_len(text: Any, limit: int, where: str, what: str) -> None:
+        """E12/W9：画布输入框字数上限。超长会被静默截断，必须编译期拦住。"""
+        n_chars = len(str(text or ""))
+        if n_chars > limit:
+            add("error", "E12", where, f"{what} {n_chars} 字，超过画布上限 {limit} 字")
+        elif n_chars > limit * NEAR_LIMIT_RATIO:
+            add("warn", "W9", where, f"{what} {n_chars} 字，接近画布上限 {limit} 字")
+
+    def check_tts_len(val: Any, where: str, what: str) -> None:
+        """播报类字段：`tts:` 开头才是文本，其余是音频 base64，不量长度。"""
+        s = str(val or "")
+        if s.startswith("tts:"):
+            check_len(s[4:], TTS_TEXT_MAX, where, what)
+
     # E1 唯一 startNode
     starts = ivr.get("startNode") or []
     if len(starts) != 1:
@@ -1707,6 +1732,34 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
                 add("error", "E15", name,
                     f"contentType 只能是 gen 或 fix，实际是 {nd.get('contentType')!r}（注意不是 fixed）")
 
+        # E12/W9 字数上限
+        if typ == "chatNode":
+            check_len(nd.get("content"), CHAT_PROMPT_MAX, name, "节点话术")
+        for b in nd.get("branches") or []:
+            if b.get("type") in ("intent", "global_intent"):
+                c = str(b.get("content") or "")
+                check_len(c, REPLY_CLASS_MAX, name, f"回复分类「{c[:12]}…」")
+        for e in nd.get("entities") or []:
+            raw = str(e.get("varName") or e.get("name") or "?")
+            vn = raw[:16] + "…" if len(raw) > 16 else raw
+            check_len(e.get("description"), VAR_DESC_MAX, name, f"词槽「{vn}」的说明")
+            check_len(e.get("name"), VAR_NAME_MAX, name, f"词槽「{vn}」的名称")
+        for v in nd.get("vars") or []:      # 赋值节点：超长保存时会被直接拦住
+            raw = str(v.get("name") or "?")
+            vn = raw[:16] + "…" if len(raw) > 16 else raw
+            check_len(raw, VAR_NAME_MAX, name, f"变量名「{vn}」")
+            check_len(v.get("description"), VAR_DESC_MAX, name, f"变量「{vn}」的提取描述")
+            check_len(v.get("value"), VAR_DESC_MAX, name, f"变量「{vn}」的固定值")
+        for key, what in (("transferring-sound", "转接提示音"),
+                          ("transfer-timeout-music", "转接超时话术"),
+                          ("transfer-error", "转接失败话术"),
+                          ("broadcast-sound", "转接成功播报")):
+            check_tts_len(nd.get(key), name, what)
+        dtmf_cfg = ((nd.get("tcccNodeData") or {}).get("dtmfConfig") or {})
+        for key, what in (("play_sound", "按键话术"), ("invalid_sound", "按错话术"),
+                          ("timeout_sound", "超时话术")):
+            check_tts_len(dtmf_cfg.get(key), name, what)
+
         # 环境相关 id 待补
         if typ == "transfer" and nd.get("mode") == "manual" and not str(nd.get("name") or "").strip():
             add("warn", "W1", name, "技能组 id 为空，导入不报错但画布保存时会提示「请选择技能组」")
@@ -1762,11 +1815,12 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
     # voiceSettings
     vs = flow.get("voiceSettings") or {}
     sp = vs.get("systemPrompt") or ""
-    if len(sp) > SYSTEM_PROMPT_MAX:
-        add("error", "E12", "voiceSettings.systemPrompt",
-            f"长度 {len(sp)} 超过上限 {SYSTEM_PROMPT_MAX}，画布会静默截断")
-    elif len(sp) > SYSTEM_PROMPT_MAX * 0.85:
-        add("warn", "W9", "voiceSettings.systemPrompt", f"长度 {len(sp)}，接近 {SYSTEM_PROMPT_MAX} 上限")
+    check_len(sp, SYSTEM_PROMPT_MAX, "voiceSettings.systemPrompt", "全局提示词")
+    for f_, lim_, what_ in (("fallbackFixMessage", SYSTEM_PROMPT_MAX, "兜底固定话术"),
+                            ("notifyMessage", NOTIFY_TEXT_MAX, "静默提示"),
+                            ("hungUpMessage", NOTIFY_TEXT_MAX, "挂机话术"),
+                            ("voicemailMessage", TTS_TEXT_MAX, "语音留言话术")):
+        check_len(vs.get(f_), lim_, f"voiceSettings.{f_}", what_)
     if vs.get("vadLevel") not in VALID_VAD_LEVELS:
         add("warn", "W6", "voiceSettings.vadLevel",
             f"vadLevel={vs.get('vadLevel')} 不在 {sorted(VALID_VAD_LEVELS)} 内，保存会报「远场人声抑制配置异常」")
@@ -2576,6 +2630,9 @@ def cmd_build(args: argparse.Namespace) -> int:
         for n in design.nodes:
             line_of[n.key] = n.line
             line_of.setdefault(n.name, n.line)
+        if design.system_prompt_line:     # 全局提示词的问题指回 30-全局提示词.md
+            line_of["全局提示词"] = design.system_prompt_line
+            line_of["voiceSettings.systemPrompt"] = design.system_prompt_line
         for i in issues:
             ln = line_of.get(i.where)
             f = src_file_of_line(origin, ln) if ln else None
