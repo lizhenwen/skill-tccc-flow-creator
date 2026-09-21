@@ -320,14 +320,13 @@
 ## 命令行
 
 ```bash
-PY=/Users/lizhenwen/.workbuddy/binaries/python/versions/3.13.12/bin/python3
-$PY scripts/tccc_flow.py build src|设计稿.md [-o 流程.json] [--emit-md 合并稿.md|--no-emit-md] \
+python3 scripts/tccc_flow.py build src|设计稿.md [-o 流程.json] [--emit-md 合并稿.md|--no-emit-md] \
                                [--base 底座.json] [--report 报告.md] [--mermaid 图.mmd] [--rewrap|--no-rewrap]
-$PY scripts/tccc_flow.py split 设计稿.md|画布.json [-o src] [--force] [--title 名称]
-$PY scripts/tccc_flow.py assemble src [-o 设计稿.md]
-$PY scripts/tccc_flow.py validate 流程.json [--design 设计稿.md] [--report 报告.md]
-$PY scripts/tccc_flow.py decompile 画布.json -o 设计稿.md [--title 名称]
-$PY scripts/tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
+python3 scripts/tccc_flow.py split 设计稿.md|画布.json [-o src] [--force] [--title 名称]
+python3 scripts/tccc_flow.py assemble src [-o 设计稿.md]
+python3 scripts/tccc_flow.py validate 流程.json [--design 设计稿.md] [--report 报告.md]
+python3 scripts/tccc_flow.py decompile 画布.json -o 设计稿.md [--title 名称]
+python3 scripts/tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
 ```
 
 - `build src`（传目录）：产物路径默认按 **src 的父目录名**取，

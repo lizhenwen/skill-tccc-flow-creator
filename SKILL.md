@@ -100,10 +100,11 @@ agent_created: true
 ### Step 2：编译
 
 ```bash
-PY=/Users/lizhenwen/.workbuddy/binaries/python/versions/3.13.12/bin/python3
 cd <项目目录>
-$PY <skill>/scripts/tccc_flow.py build src [--base 上一版.json]
+python3 <skill>/scripts/tccc_flow.py build src [--base 上一版.json]
 ```
+
+用 PATH 里的 `python3`（3.9+，零依赖）。**不要写死本机或 WorkBuddy 的 python 绝对路径**（账号、版本号都会变）。
 
 **传目录就一条命令搞定两份产物**，路径按项目目录名自动取（目录 `5881-售后处理流程/`）：
 
@@ -126,10 +127,10 @@ warning 不阻断，但要把终端里的 warning 在最终回复里向用户点
 ### Step 3：改存量画布
 
 ```bash
-$PY <skill>/scripts/tccc_flow.py decompile 导出的画布.json -o /tmp/x.md
-$PY <skill>/scripts/tccc_flow.py split /tmp/x.md -o src      # 拆成分片，之后只维护 src/
+python3 <skill>/scripts/tccc_flow.py decompile 导出的画布.json -o /tmp/x.md
+python3 <skill>/scripts/tccc_flow.py split /tmp/x.md -o src      # 拆成分片，之后只维护 src/
 #   改分片 …
-$PY <skill>/scripts/tccc_flow.py build src --base 导出的画布.json
+python3 <skill>/scripts/tccc_flow.py build src --base 导出的画布.json
 ```
 
 改存量画布**每次 build 都要带 `--base 上一版.json`**（先 `cp` 一份当底座），

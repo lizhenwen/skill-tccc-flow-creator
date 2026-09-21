@@ -49,11 +49,11 @@ skill 装在 `~/.workbuddy/skills/skill-tccc-flow/`，在 WorkBuddy 会话里会
 命令行直接用的话只需要一个 Python 3.9+（无需 `pip install`，无需 node）：
 
 ```bash
-PY=/Users/lizhenwen/.workbuddy/binaries/python/versions/3.13.12/bin/python3
 SK=~/.workbuddy/skills/skill-tccc-flow
-
-$PY $SK/scripts/tccc_flow.py --help
+python3 $SK/scripts/tccc_flow.py --help
 ```
+
+用 PATH 里的 `python3` 即可，不要写死 `~/.workbuddy/binaries/python/...`（版本目录会变）。
 
 ---
 
@@ -63,8 +63,8 @@ $PY $SK/scripts/tccc_flow.py --help
 
 ```bash
 mkdir -p /tmp/我的流程 && cp $SK/assets/example-催件查询.md /tmp/我的流程/
-$PY $SK/scripts/tccc_flow.py split /tmp/我的流程/example-催件查询.md -o /tmp/我的流程/src
-$PY $SK/scripts/tccc_flow.py build /tmp/我的流程/src
+python3 $SK/scripts/tccc_flow.py split /tmp/我的流程/example-催件查询.md -o /tmp/我的流程/src
+python3 $SK/scripts/tccc_flow.py build /tmp/我的流程/src
 ```
 
 ```
@@ -299,10 +299,10 @@ tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
 # 1. 建项目目录（目录名 = 产物名，建议「画布ID-流程名」）
 mkdir -p 5881-我的流程 && cp $SK/assets/example-催件查询.md 5881-我的流程/
 # 2. 拆成 src 分片，之后只维护 src/
-$PY $SK/scripts/tccc_flow.py split 5881-我的流程/example-催件查询.md -o 5881-我的流程/src
+python3 $SK/scripts/tccc_flow.py split 5881-我的流程/example-催件查询.md -o 5881-我的流程/src
 # 3. 改分片（节点、话术、分支、接口），加节点就在 src/50-节点/ 里新建文件
 # 4. 编译（三份产物一次落盘）
-$PY $SK/scripts/tccc_flow.py build 5881-我的流程/src
+python3 $SK/scripts/tccc_flow.py build 5881-我的流程/src
 # 5. 有 error 按报告改对应分片，重复第 4 步
 ```
 
@@ -310,11 +310,11 @@ $PY $SK/scripts/tccc_flow.py build 5881-我的流程/src
 
 ```bash
 # 1. 从画布导出 JSON，逆编译再拆片
-$PY $SK/scripts/tccc_flow.py decompile 导出的画布.json -o /tmp/x.md
-$PY $SK/scripts/tccc_flow.py split /tmp/x.md -o 5881-我的流程/src
+python3 $SK/scripts/tccc_flow.py decompile 导出的画布.json -o /tmp/x.md
+python3 $SK/scripts/tccc_flow.py split /tmp/x.md -o 5881-我的流程/src
 # 2. 改分片（加节点、调话术、补分支）
 # 3. 带上原 JSON 当底座编译回去
-$PY $SK/scripts/tccc_flow.py build 5881-我的流程/src --base 导出的画布.json
+python3 $SK/scripts/tccc_flow.py build 5881-我的流程/src --base 导出的画布.json
 # 4. diff 一下确认改动范围符合预期
 ```
 
@@ -327,7 +327,7 @@ $PY $SK/scripts/tccc_flow.py build 5881-我的流程/src --base 导出的画布.
 ```bash
 cp 5881-我的流程.json /tmp/base.json          # 上一期的 JSON 当底座
 # 只往 src/50-节点/ 里加/改本期的节点分片，未开发的场景先指向转人工节点
-$PY $SK/scripts/tccc_flow.py build 5881-我的流程/src --base /tmp/base.json
+python3 $SK/scripts/tccc_flow.py build 5881-我的流程/src --base /tmp/base.json
 ```
 
 已验证节点的 id 全部保留，本期只验「路由进场景 + 场景内话术」。
@@ -442,15 +442,15 @@ decompile 会把原 id 写成 `- ID:` 属性，`--base` 靠它精确匹配。
 | 校验规则 | `flow/validate/validateFlowDataOnSave.ts` + `validateXGraph.ts` |
 
 回归自测（改完脚本务必跑一遍）：先跑单测
-`$PY $SK/scripts/tccc_flow_roundtrip.test.py && $PY $SK/scripts/tccc_flow_layout.test.py`，
+`python3 $SK/scripts/tccc_flow_roundtrip.test.py && python3 $SK/scripts/tccc_flow_layout.test.py`，
 再手动过一遍真实画布往返：
 
 ```bash
 # 1. 从零编译示例
-$PY $SK/scripts/tccc_flow.py build $SK/assets/example-催件查询.md -o /tmp/ex.json
+python3 $SK/scripts/tccc_flow.py build $SK/assets/example-催件查询.md -o /tmp/ex.json
 # 2. 真实画布往返保真（换成自己手上的导出 JSON）
-$PY $SK/scripts/tccc_flow.py decompile 真实画布.json -o /tmp/x.md
-$PY $SK/scripts/tccc_flow.py build /tmp/x.md -o /tmp/x-rb.json --base 真实画布.json
+python3 $SK/scripts/tccc_flow.py decompile 真实画布.json -o /tmp/x.md
+python3 $SK/scripts/tccc_flow.py build /tmp/x.md -o /tmp/x-rb.json --base 真实画布.json
 # 3. 逐字段比对 /tmp/x-rb.json 与 真实画布.json 的 nodeData 与 outEdges
 ```
 
