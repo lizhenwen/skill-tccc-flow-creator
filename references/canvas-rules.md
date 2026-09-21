@@ -45,8 +45,11 @@ type 名映射（`transformToFlowData` 的 switch，`:1741-2369`）：
 - 边的 `startPoint.x/y`、`endPoint.x/y` **被忽略**，只读 `anchorIndex`（`ivrEToX6E` `utils.ts:438-439`）。
 - 多出口节点的出锚点由 `transformMultiExportNodeFlowDataOutEdges`（`:538`）重算：`branchId = edgeData.branchId || 按 source 反查` → `sourceAnchor = branchIndex + 1`；
   查不到才退回 `startPoint.anchorIndex`。
+- `logicSplitBranches` 里 **id 必须唯一**；否则分支固定为 `"else"`。若普通条件也占用 `"else"`，反查会命中第一条，两条出边叠到同一锚点，真正的否则出口变成没连线。
 - 锚点语义：`0` = 左侧入锚点，`1..n` = 第 n 个分支出锚点（`MultiExportNode.js:1905`, `:1949`；反查 `newStyleUtil.ts:79-83`）。
 - `chatNode` 的画布分支 = `filterGlobalReplyClasses(branches)`，即**剔除 `global_intent` 后**的列表（`utils.ts:1820`）。锚点序号要按剔除后的下标算。
+- 词槽节点（`replyMode=intent_with_entity`）的视觉顺序由 `orderVoiceConversationBranches` 重排：**收集成功在上，意图分类在下，silent 垫底**（`QaTree.vue:187-209`，`newStyleUtil.ts:55-58`）。JSON 里的 `branches` 必须已经是这个顺序，导入算锚点时用的是 JSON 原顺序，不会再按视觉重排。
+- **不要写 `entity_fail`**。画布把它当已废弃分支，`transformNodeData` 里 `removeDeprecatedCollectionFailBranch`（`QaTree.vue:652-657`）会剥掉它，但导入算锚点时它还占一位 → 后面的连线全部错位。未抽中词槽会停留在本节点重试，不需要失败出口。
 - `chatNode.selectBranch` → 内部 `conversationData.listenUserReply`（`utils.ts:1823`）。
   缺省 `false`，**会让节点被判为单出口**。
 
@@ -77,7 +80,7 @@ type 名映射（`transformToFlowData` 的 switch，`:1741-2369`）：
 | 10 | DTMF 三类分支必须全连线 | —— | `:388-421` |
 | 11 | 接口节点分支 branchId 不可重复 | —— | `:423-438` |
 | 12 | 结束/转接类节点不能有出边 | 该节点不能有出口连线 | `:496` |
-| 13 | 全局节点必须至少一个非空 `global_intent` | —— | `:1096-1113` |
+| 13 | 全局节点必须至少一个非空 `global_intent` | —— | `:1096-1113`（本工具只对**听回复**的全局对话节点报 E7：纯播报全局节点线上允许没有触发语，存量画布会把孤立节点标成全局以通过可达性校验） |
 | 14 | 词槽收集必须填收集变量名 | 词槽收集功能必须填写收集变量名 | `:1035-1049` |
 | 15 | `vadLevel` ∈ {0,1,2,3,100} | 远场人声抑制配置异常 | `:986-991` |
 | 16 | 必须选择热词表（0=不使用也算有效） | 请在「聆听设置-热词表」中选择热词表 | `:994-996` |
@@ -126,3 +129,4 @@ type 名映射（`transformToFlowData` 的 switch，`:1741-2369`）：
   音频 base64 不受这条限制（校验只量 `tts:` 开头的值）。
 - 导入期不校验长度（见上文「导入期：几乎不校验」），**"导入成功"不等于没超限**，
   超长内容要么在画布里编辑该字段时被 `maxlength` 砍掉，要么运行时按截断后的内容执行。
+- 逻辑条件判断（`logicSplitNode`）**单条分支**的 `conditions` 上限 **30**。这是运行时硬限制：超过后每次请求经过该节点都会触发超限检测（导入/保存未必当场拦住）。超过 30 个取值必须拆成级联判断节点。

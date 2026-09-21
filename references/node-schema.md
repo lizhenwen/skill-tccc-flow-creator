@@ -50,6 +50,7 @@
 - `anchorIndex`：**0 = 左侧入锚点，1..n = 第 n 个分支的右侧出锚点**。
   计算时要**排除 `global_intent` 分支**（它不占锚点）。
 - `edgeData.branchId` 优先级**高于** `anchorIndex`，两个都写最稳。
+- `logicSplitNode` 的否则分支 id **必须是**字符串 `"else"`，且同一节点里只能出现一次。普通条件若也写成 `"else"`，导入按 id 反查锚点时会把否则连线和该条件连线全部叠到同一出口。
 - 边 `type`：`chatNode` 恒为 `custom:cubic-horizontal`（哪怕是纯播报单出口）；
   `startNode` / `extractVariableNode` 用 `""`。
 
@@ -61,9 +62,10 @@
 | ttsSpeed | 1 | |
 | maxDuration | 60 | **秒**；导入时 ×1000 |
 | notifyDuration | 10 | **秒**；导入时 ×1000 |
-| notifyMaxCount / notifyType / notifyMessage | 1 / 0 / 抱歉，我没有听清楚… | 无应答追问 |
-| hungUpMessage | 那就不打扰您了，再见。 | |
-| systemPrompt | "" | **上限 8192 字**，超长静默截断 |
+| notifyMaxCount / notifyType / notifyMessage | 1 / 0 / 抱歉，我没有听清楚… | 无应答追问；提示语**上限 100 字** |
+| hungUpMessage | 那就不打扰您了，再见。 | **上限 100 字** |
+| systemPrompt | "" | **上限 8192 字**，超长静默截断（`fallbackFixMessage` 同） |
+| voicemailMessage | 你好，抱歉无法接待… | **上限 300 字** |
 | vadLevel | 100 | 只能是 0/1/2/3/100，否则保存报「远场人声抑制配置异常」 |
 | vadSilenceTime / interruptSpeechDuration | 500 / 500 | 毫秒 |
 | aiBotId | 0 | **导入时被强制覆盖**成当前机器人 id |
@@ -83,13 +85,13 @@
 ```json
 {
   "welcomeText": "<话术>",       // 与 content 保持一致
-  "content": "<话术>",
+  "content": "<话术>",           // 上限 5000 字
   "fileId": "",
   "contentType": "gen",          // gen=智能生成 / fix=固定话术（不是 fixed！）
   "selectBranch": true,          // == 内部 listenUserReply，false 时该节点算单出口
   "allowInterrupt": false,
   "silentWaitTime": 10,          // 可选，线上很多节点没有这个字段
-  "branches": [ { "id", "type", "content", "name": "", "tags": [] } ],
+  "branches": [ { "id", "type", "content", "name": "", "tags": [] } ],   // content 单条上限 300 字
   "entities": [ ... ],
   "collectionConfig": { ... },   // 只有配了词槽才有
   "replyMode": "intent",         // intent / intent_with_entity；纯播报节点无此字段
@@ -104,11 +106,12 @@
 | type | 含义 | 谁产生 |
 |---|---|---|
 | intent | 普通意图分类 | 业务设计 |
-| entity_success / entity_fail | 词槽收集成功/失败 | 由收集配置派生 |
-| silent | 用户无响应 | 系统分支 |
+| entity_success | 词槽收集成功 | 配了收集变量就必须有；必须排在意图分类前面 |
+| silent | 用户无响应 | 系统分支，视觉上垫在分类组末尾 |
 | else | 其他兜底 | 系统分支，导入后不可编辑 |
 | global_intent | 全局触发语 | 全局节点专用，不占画布锚点 |
 
+> `entity_fail`（收集失败）**已废弃**，不要写进 JSON。画布 `QaTree.removeDeprecatedCollectionFailBranch` 会在导入后剥掉它，但它在导入算锚点时还占一位，后面的连线会全部错位。
 > `noreply` 不存在，别用。
 
 ### 词槽（entities / collectionConfig）
@@ -117,8 +120,8 @@
 "entities": [{
   "slotType": "custom",          // 只写 custom
   "varName": "运单号",            // 收集结果存进这个变量
-  "name": "运单号",               // 词槽名
-  "description": "提取 13-15 位连续数字…",
+  "name": "运单号",               // 词槽名，上限 50 字
+  "description": "提取 13-15 位连续数字…",   // 上限 1000 字
   "id": "entity-<uuid>"          // 无 slotId 时的前端临时 id
 }],
 "collectionConfig": {
@@ -130,7 +133,7 @@
 
 - `slotId` 是**账号维度的服务端词槽主键**。不填 → 保存时 `syncConversationSlots`自动建槽并把临时 id 换成真实 slotId。**伪造 slotId 前端不报错，运行时指向不存在的词槽。**
 - `slotType` 只使用 `custom`。`collectionType` 写 slotId 或临时 id，不要写类型字面量。
-- 有 `entities` 时 `replyMode` 必须是 `intent_with_entity`，且必须有 `entity_success` 分支。
+- 有 `entities` 时 `replyMode` 必须是 `intent_with_entity`，且必须有 `entity_success` 分支（排在意图分类前面）。**不要**写 `entity_fail`。
 - 一个节点只能有一个 entity。
 
 ## apiCallNode.nodeData
@@ -161,10 +164,10 @@
 {
   "vars": [{
     "id": "voice-variable-assign-relation-<uuid>",
-    "name": "单号后四位",
+    "name": "单号后四位",          // 上限 50 字
     "mode": "llm",               // llm=大模型提取 / fix=固定值或 ${} 表达式
-    "description": "<mode=llm 时的提示词>",
-    "value": "<mode=fix 时的值>",
+    "description": "<mode=llm 时的提示词>",   // 上限 1000 字
+    "value": "<mode=fix 时的值>",             // 上限 1000 字
     "needSave": true,
     "messageRounds": 5
   }],
@@ -174,6 +177,7 @@
 ```
 
 > 只有 `llm` 和 `fix` 两种 mode，没有 `fixed` / `expression`。
+> 这三条长度限制是画布**保存时硬拦**（有明确报错文案），不像别处那样静默截断。
 
 ## logicSplitNode.nodeData
 
@@ -191,9 +195,10 @@
 }
 ```
 
-- 连线 `source` 用 `logicSplitBranches[i].id`，else 分支就是字符串 `"else"`。
+- 连线 `source` 用 `logicSplitBranches[i].id`，else 分支就是字符串 `"else"`（只能给 `logicType=else` 那一条，禁止给普通条件）。
 - 线上出现过的 operator：`==` `exists` `gt`（还支持 `!=` `>=` `<=` `contains` 等）。
 - 单目运算符（`exists` / `not_exists`）**不写 `val` 字段**。
+- **单条分支 `conditions` 不得超过 30**（运行时硬上限，校验 E19）。超了每次请求经过该节点都会触发超限检测。
 
 ## workTimeNode.nodeData
 
@@ -330,13 +335,12 @@ transfer-*            = max(120, 156 + 分支区)
 
 分支数按 `nodeData.branches` **全量**计（含 `global_intent`），与画布估算器一致——偏保守，多留空间不会造成重叠。
 
-布局参数：层距 `LAYER_GAP=440`、起点 `(350, 300)`、同层行距 `ROW_GAP=48`。
-同一层内按声明顺序自上而下堆叠，`y_{k+1} = y_k + 节点高 + 48`。
+布局对齐画布「一键整理」：主干沿第一出边从左到右（层距 `COLUMN_GAP=420` = 节点宽 260 + 间距 160），起点 `(350, 300)`；其余分支在父节点右侧纵向展开，同列视觉间隙 ≥16px。出边 ≥4 时第一出口不再延续主干。
 
-> G6 以静态 `nodeStyle.height`(172) 的一半为绘制原点，节点实际向下延伸真实高度，
-> 因此相邻 y 的差值只要 ≥ 上一个节点的真实高度就不会重叠。
+> G6 以静态 `nodeStyle.height`(172) 的一半为绘制原点，节点实际向下延伸真实高度。
+> 同列防重叠：`y_{k+1} ≥ y_k + 节点高 + 16`。
 
-`- 坐标: x,y` 属性（decompile 会自动写入）优先级最高，会跳过自动布局，所以改存量画布时节点不会乱跑。
+存量节点的 `x/y` 默认从 `--base` JSON 按节点 id 继承；加 `--relayout`（应用编译默认）则全部按流程重排。md 里如果还残留 `- 坐标:` 则优先用它（`--relayout` 时忽略）。
 
 ## 未支持
 

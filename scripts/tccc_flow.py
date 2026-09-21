@@ -40,6 +40,8 @@ VAR_NAME_MAX = 50          # 变量名 / 词槽名
 TTS_TEXT_MAX = 300         # 播报类短文本：转接提示音、超时/失败话术、DTMF 各段话术、留言话术
 NOTIFY_TEXT_MAX = 100      # 静默提示 / 挂机话术（no-response-settings.vue:64,101）
 NEAR_LIMIT_RATIO = 0.9     # 超过上限这个比例就提前预警（W9）
+# 逻辑条件判断节点：单条分支 conditions 不得超过 30，超了运行时每次经过都触发超限检测。
+LOGIC_SPLIT_BRANCH_CONDITION_MAX = 30
 VALID_VAD_LEVELS = {0, 1, 2, 3, 100}
 BUILTIN_VARS = {"StaffNo", "SessionId"}
 
@@ -159,6 +161,15 @@ WORD_OPS = {
     "exists": "exists", "not_exists": "not_exists",
 }
 UNARY_OPS = {"exists", "not_exists"}
+# 逆编译写中文别名。画布 JSON 里是 contains/exists，设计稿习惯写「包含」「存在」；
+# 「用线上覆盖」若原样吐英文，每个判断节点都会冒出一堆无意义 diff。
+OP_ZH = {
+    "gt": "大于", "lt": "小于", "gte": "大于等于", "lte": "小于等于",
+    "eq": "==", "neq": "!=",
+    "contains": "包含", "not_contains": "不包含",
+    "in": "属于", "not_in": "不属于",
+    "exists": "存在", "not_exists": "不存在",
+}
 
 
 class DesignError(Exception):
@@ -177,6 +188,42 @@ def _uuid_like(seed: str, salt: str = "") -> str:
 
 def node_id_of(no: str, name: str) -> str:
     return "node-" + _uuid_like(f"{no}::{name}", "node")
+
+
+def resolve_node_ids(design: Design, base: dict[str, Any] | None = None) -> dict[str, str]:
+    """每个节点写入 JSON 的 id。
+
+    优先级：分片 `- ID:` → 与 --base 同哈希 id → --base 同名且唯一 → 新建哈希。
+    这样发布能把线上真实 id 回填进 src，改名也不会拆成新节点。
+    """
+    base_nodes: list[dict[str, Any]] = []
+    if base:
+        for arr in (base.get("ivrData") or {}).values():
+            if not isinstance(arr, list):
+                continue
+            for nd in arr:
+                if isinstance(nd, dict) and nd.get("id"):
+                    base_nodes.append(nd)
+    by_id = {str(n["id"]): n for n in base_nodes}
+    name_ids: dict[str, list[str]] = {}
+    for n in base_nodes:
+        name_ids.setdefault(str(n.get("name") or ""), []).append(str(n["id"]))
+
+    used: set[str] = set()
+    ids: dict[str, str] = {}
+    for n in design.nodes:
+        explicit = (n.node_id or "").strip()
+        hashed = node_id_of(n.no, n.name)
+        if explicit:
+            chosen = explicit
+        elif hashed in by_id and hashed not in used:
+            chosen = hashed
+        else:
+            cands = [i for i in name_ids.get(n.name, []) if i not in used]
+            chosen = cands[0] if len(cands) == 1 else hashed
+        ids[n.no] = chosen
+        used.add(chosen)
+    return ids
 
 
 def branch_id_of(node_key: str, index: int, content: str) -> str:
@@ -263,6 +310,8 @@ class Design:
     passthrough: list[tuple[str, str]] = field(default_factory=list)  # (section 标题, 原文)
     injected_vars: list[str] = field(default_factory=list)
     rewrap_stats: int = 0            # build 时合并掉的硬折行数量
+    notes: list[tuple[str, str]] = field(default_factory=list)  # (节点 key, 编译期 warning)
+    node_ids: dict[str, str] = field(default_factory=dict)
     system_prompt_line: int = 0      # 「## 全局提示词」所在行，用于把校验问题指回 src 分片
 
     @property
@@ -577,7 +626,13 @@ def _parse_nodes(d: Design, body: list[str], start: int) -> None:
 
         if s.startswith(("→", "->", "=>")):
             tgt, tname = _parse_target(s, ln)
-            cur.next, cur.next_name = tgt, tname
+            # 意图文案末尾带 \n 时，逆编译会把「 → Nxx」挤到下一行。
+            # 上一条分支还没写目标，就归属它；否则才是单出口节点的默认下一跳。
+            last = cur.branches[-1] if cur.branches else None
+            if last is not None and not last.target:
+                last.target, last.target_name = tgt, tname
+            else:
+                cur.next, cur.next_name = tgt, tname
             continue
 
         if s.startswith("-"):
@@ -635,7 +690,7 @@ def _parse_branch(node: Node, s: str, ln: int) -> Branch:
         raw = left.strip()
         if right.strip():
             target, tname = _parse_target("→ " + right.strip(), ln)
-    content = raw.strip()
+    content = _branch_text(_unesc(raw.strip()))
     if not content:
         raise DesignError(f"第 {ln} 行：分支内容为空")
 
@@ -733,7 +788,19 @@ def _parse_conditions(expr: str, ln: int) -> tuple[list[dict[str, Any]], str]:
         if op not in UNARY_OPS:
             cond["val"] = right.strip().strip("\"'")
         conds.append(cond)
+    if len(conds) > LOGIC_SPLIT_BRANCH_CONDITION_MAX:
+        raise DesignError(f"第 {ln} 行：{_over_limit_branch_conditions_msg(len(conds))}")
     return conds, logic
+
+
+def _over_limit_branch_conditions_msg(count: int) -> str:
+    cap = LOGIC_SPLIT_BRANCH_CONDITION_MAX
+    return (
+        f"单个分支配置了 {count} 个条件，超过系统上限 {cap}。"
+        f"运行时每次经过该节点都会触发超限检测。"
+        f"请拆成级联判断节点：每条分支最多 {cap} 个条件，命中走目标，"
+        f"否则接到下一判断节点继续匹配剩余值"
+    )
 
 
 # 工作时间判断：dayType 只有这四种，画布导入时用它反查规则类型，
@@ -869,6 +936,36 @@ def canvas_branch_list(n: Node) -> list[Branch]:
     return [b for b in n.branches if b.kind != "global_intent"]
 
 
+def _listens(n: Node) -> bool:
+    """是否勾选「用户回复分类」（外部 JSON selectBranch / 内部 listenUserReply）。
+
+    没有画布分类分支时必须是 false：空 branches + selectBranch=true
+    会让线上编辑器勾上分类并报错。
+    """
+    if n.kind == "announce":
+        return False
+    has_canvas_br = bool([b for b in n.branches if b.kind != "global_intent"])
+    if not has_canvas_br:
+        return False
+    if n.a("听用户回复") is not None:
+        return _to_bool(n.a("听用户回复"))
+    return True
+
+
+def node_outgoing(n: Node, by_no: dict[str, Node]) -> list[str]:
+    """与 build_json 实际写出的出边一致，顺序即画布 sourceAnchor 从小到大。"""
+    cbrs = canvas_branch_list(n)
+    use_multi = (
+        n.kind in MULTI_EXIT_KINDS
+        and bool(cbrs)
+        and not (n.kind == "chat" and not _listens(n))
+    )
+    if use_multi:
+        return [b.target for b in cbrs if b.target and b.target in by_no]
+    tgt = n.next or (cbrs[0].target if cbrs else None)
+    return [tgt] if tgt and tgt in by_no else []
+
+
 def _split_tags(spec: str) -> tuple[str, list[tuple[str, str]]]:
     tags: list[tuple[str, str]] = []
     m = TAG_BLOCK.search(spec)
@@ -890,12 +987,25 @@ def _esc(s: str) -> str:
     return str(s).replace("\n", "\\n")
 
 
-def _normalize_branches(n: Node) -> None:
-    """规范化：触发属性 -> global_intent 分支；系统分支 content 用画布固定写法。"""
+def _branch_text(s: Any) -> str:
+    """分支文案写成设计稿单行。线上意图常带末尾换行，丢掉不影响识别，避免稿子里出现明文 \\n。"""
+    t = str(s or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    return t.replace("\n", "")
+
+
+def _normalize_branches(n: Node) -> list[str]:
+    """规范化：触发属性 -> global_intent 分支；系统分支 content 用画布固定写法。
+
+    对话节点还会：
+    - 丢掉已废弃的 entity_fail（画布 QaTree.removeDeprecatedCollectionFailBranch）
+    - 按画布视觉顺序重排：global_intent → entity_success → intent/else → silent
+    """
+    warns: list[str] = []
     existing = {b.content for b in n.branches if b.kind == "global_intent"}
     gl: list[Branch] = []
     for spec in n.alist("触发"):
         content, tags = _split_tags(spec)
+        content = _unesc(content)
         if content and content not in existing:
             gl.append(Branch(kind="global_intent", content=content, tags=tags))
     if gl:
@@ -904,63 +1014,181 @@ def _normalize_branches(n: Node) -> None:
         n.is_global = True
 
     if n.kind not in ("chat", "announce"):
-        return
+        return warns
     var = n.a("收集变量")
     wait = n.aint("静默等待(秒)", 10)
+    kept: list[Branch] = []
     for b in n.branches:
+        if b.kind == "entity_fail":
+            if b.target:
+                warns.append(
+                    "「收集失败」是画布已废弃分支，已忽略；"
+                    f"原指向 {b.target} 的连线不会生成（未抽中词槽会停留在本节点重试）")
+            else:
+                warns.append(
+                    "「收集失败」是画布已废弃分支，已忽略；未抽中词槽会停留在本节点重试")
+            continue
         if b.kind == "entity_success":
             b.content = f"收集${{{var}}}结束" if var else "收集完成"
-        elif b.kind == "entity_fail":
-            b.content = "收集失败"
         elif b.kind == "silent" and re.match(r"^(无应答|静默|沉默)\s*$", b.content):
             b.content = f"用户无响应{wait}秒"
+        kept.append(b)
+    n.branches = kept
+    _order_chat_canvas_branches(n)
+    return warns
+
+
+def _order_chat_canvas_branches(n: Node) -> None:
+    """与画布 orderVoiceConversationBranches 对齐，保证导入锚点不错位。
+
+    视觉顺序：收集成功在上，意图分类在下，silent 垫底。global_intent 仍置顶
+    （导入时 filterGlobalReplyClasses 会剥掉，不占锚点）。
+    """
+    gl, success, silent, rest = [], [], [], []
+    for b in n.branches:
+        if b.kind == "global_intent":
+            gl.append(b)
+        elif b.kind == "entity_success":
+            success.append(b)
+        elif b.kind == "silent":
+            silent.append(b)
+        else:
+            rest.append(b)
+    n.branches = gl + success + rest + silent
+
+
+def _condition_fp(b: Branch) -> tuple[Any, ...]:
+    if b.kind == "else":
+        return ("else",)
+    if b.extra.get("method") == "llm":
+        return ("llm", b.extra.get("llmPrompt") or b.content)
+    conds = tuple(
+        (c.get("var"), c.get("operator"), c.get("val"))
+        for c in (b.extra.get("conditions") or [])
+    )
+    return ("rule", b.extra.get("logicType", "and"), conds)
+
+
+def _base_condition_fp(raw: dict[str, Any]) -> tuple[Any, ...]:
+    if raw.get("logicType") == "else":
+        return ("else",)
+    if raw.get("method") == "llm":
+        return ("llm", raw.get("llmPrompt") or raw.get("content") or "")
+    conds = tuple(
+        (c.get("var"), c.get("operator"), c.get("val"))
+        for c in (raw.get("conditions") or [])
+    )
+    return ("rule", raw.get("logicType", "and"), conds)
 
 
 def _resolve_branch_ids(n: Node, base_node: dict[str, Any] | None) -> None:
     """给分支分配 id：消耗式复用 --base 里的既有 id，保证回编译后 diff 最小。
 
-    匹配优先级：① type+content 完全相同 ② 同 type 按出现顺序 ③ 基于 key 的稳定 hash。
+    匹配优先级：① type+content（条件节点=条件指纹）完全相同 ② 对话节点同 type 按出现顺序
+    ③ 基于 key 的稳定 hash。
     「消耗式」= 每个底座 id 只会被认领一次，避免同名分支拿到重复 id。
+
+    条件 / 工时节点绝不能按位置继承 id。中间插入新分支时，按位置会把保留字
+    ``else`` 错赋给普通条件；导入时 ``edgeData.branchId`` 按 id 反查锚点，
+    同 id 的出边会全部叠到第一个匹配分支上，真正的否则分支变成没连线。
     """
     pool: list[dict[str, Any]] = []
-    positional: list[str] = []
+    cond_pool: list[dict[str, Any]] = []
+    wt_pool: list[dict[str, Any]] = []
     if base_node:
         nd = base_node.get("nodeData", {})
         pool = [dict(b) for b in (nd.get("branches") or []) if b.get("id")]
         if n.kind == "condition":
-            positional = [str(b.get("id")) for b in (nd.get("logicSplitBranches") or [])]
+            cond_pool = [dict(b) for b in (nd.get("logicSplitBranches") or []) if b.get("id")]
         elif n.kind == "worktime":
-            positional = [str(b.get("id")) for b in (nd.get("workTimeBranches") or [])]
+            wt_pool = [dict(b) for b in (nd.get("workTimeBranches") or []) if b.get("id")]
     taken: set[int] = set()
+    cond_taken: set[int] = set()
+    wt_taken: set[int] = set()
+    used_bids: set[str] = set()
+
+    def take_id(bid: str, idx: int | None = None, bucket: set[int] | None = None) -> str:
+        if idx is not None and bucket is not None:
+            bucket.add(idx)
+        used_bids.add(bid)
+        return bid
 
     def claim(kind: str, content: str) -> str | None:
         for i, b in enumerate(pool):          # ① type + content
             if i in taken:
                 continue
+            bid = str(b["id"])
+            if bid in used_bids:
+                continue
             if str(b.get("type")) == kind and str(b.get("content") or "") == content:
-                taken.add(i)
-                return str(b["id"])
+                return take_id(bid, i, taken)
         for i, b in enumerate(pool):          # ② 同 type 按顺序
             if i in taken:
                 continue
+            bid = str(b["id"])
+            if bid in used_bids:
+                continue
             if str(b.get("type")) == kind:
-                taken.add(i)
-                return str(b["id"])
+                return take_id(bid, i, taken)
         return None
 
-    j = -1
+    def claim_condition(b: Branch) -> str | None:
+        fp = _condition_fp(b)
+        for i, raw in enumerate(cond_pool):
+            if i in cond_taken:
+                continue
+            if _base_condition_fp(raw) != fp:
+                continue
+            bid = str(raw["id"])
+            # 底座若已被污染（普通条件占用了 else），丢掉这个 id 另发新的
+            if b.kind != "else" and bid == "else":
+                continue
+            if bid in used_bids:
+                continue
+            return take_id(bid, i, cond_taken)
+        return None
+
+    def claim_worktime(b: Branch) -> str | None:
+        for i, raw in enumerate(wt_pool):
+            if i in wt_taken:
+                continue
+            bid = str(raw["id"])
+            if bid in used_bids:
+                continue
+            if str(raw.get("type") or "") == b.kind and str(raw.get("name") or "") == b.content:
+                return take_id(bid, i, wt_taken)
+        return None
+
     for i, b in enumerate(n.branches):
-        if b.kind != "global_intent":
-            j += 1
         if b.bid:
+            used_bids.add(b.bid)
             continue
         if n.kind == "condition" and b.kind == "else":
             b.bid = "else"
+            used_bids.add("else")
+            for j, raw in enumerate(cond_pool):
+                if j not in cond_taken and (
+                    raw.get("logicType") == "else" or str(raw.get("id")) == "else"
+                ):
+                    cond_taken.add(j)
             continue
-        if positional and b.kind != "global_intent" and 0 <= j < len(positional):
-            b.bid = positional[j]
+        claimed = None
+        if n.kind == "condition":
+            claimed = claim_condition(b)
+        elif n.kind == "worktime":
+            claimed = claim_worktime(b)
+        else:
+            claimed = claim(b.kind, b.content)
+        if claimed:
+            b.bid = claimed  # take_id 已写入 used_bids
             continue
-        b.bid = claim(b.kind, b.content) or branch_id_of(n.key, i, b.content)
+        bid = branch_id_of(n.key, i, b.content)
+        n_try = 0
+        while bid in used_bids:
+            n_try += 1
+            bid = branch_id_of(n.key, i, f"{b.content}::{n_try}")
+        b.bid = bid
+        used_bids.add(bid)
 
 
 # ============================================================================
@@ -991,8 +1219,23 @@ CHAT_MIN_H = 168
 GLOBAL_CHAT_MIN_H = 214
 HANGUP_H = 48                   # 结束通话节点（画布估算器未覆盖，用真实节点样式高度）
 
-# 布局参数：层距要容得下 260 宽的节点 + 连线弯折空间
-LAYER_GAP, ORIGIN_X, ORIGIN_Y, ROW_GAP = 440, 350, 300, 48
+# 布局参数：对齐画布「一键整理」manualLayoutHumanize.ts
+# 层距 = 节点宽 260 + 主干间距 160，容得下节点本身和连线弯折
+MAIN_CHAIN_GAP = 160
+COLUMN_GAP = NODE_W + MAIN_CHAIN_GAP          # 420
+LAYER_GAP = COLUMN_GAP                        # 旧名，文档/测试仍可能引用
+BRANCH_GAP = 40
+ROW_GAP = BRANCH_GAP
+ORIGIN_X, ORIGIN_Y = 350, 300
+STATIC_H_HALF = 86                            # 画布以静态 nodeStyle.height(172) 的一半做绘制原点
+BRANCH_MENU_EDGE_THRESHOLD = 4                # 出边 ≥4 时第一出口不再延续主干
+BRANCH_MENU_MAX_ROWS = 3
+MIN_VERTICAL_GAP = 16                         # 同列防重叠的最小视觉间隙
+VERTICAL_LANE_X_TOLERANCE = 24
+MERGE_NODE_MIN_INCOMING = 3
+ORPHAN_FOREST_COLUMNS = 4
+ORPHAN_FOREST_SAFE_Y_GAP = 240
+DETACHED_LEAF_PARKING_COLUMNS = 1
 
 
 def branch_section_height(count: int) -> float:
@@ -1062,57 +1305,472 @@ def estimate_node_height(n: Node) -> float:
     return H_DEFAULT
 
 
-def layout(design: Design) -> dict[str, tuple[float, float]]:
-    """分层布局：主干水平推进，同层纵向堆叠。
+@dataclass
+class _LayoutMeta:
+    parent: str | None = None
+    depth: int = 0
+    branch_index: int = 0
+    is_main: bool = False
+    is_orphan: bool = False
+    orphan_rank: int = 0
 
-    节点高度用 estimate_node_height() 精确估算（1:1 对齐画布的几何估算器），
-    所以分支多的对话节点会自动拿到更大的纵向空间，不会压到下一个节点。
+
+@dataclass
+class _BranchGroup:
+    parent_id: str
+    root_ids: list[str] = field(default_factory=list)
+    ordered_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _LayoutModel:
+    main_chain: list[str]
+    branch_groups: list[_BranchGroup]
+    meta: dict[str, _LayoutMeta]
+    orphan_ids: list[str]
+    incoming: dict[str, list[str]]
+
+
+def _collect_preserved_pos(design: Design, ids: dict[str, str] | None,
+                           base: dict[str, Any] | None) -> dict[str, tuple[float, float]]:
+    """存量坐标：md 里残留的 `- 坐标:` 优先，否则从 --base JSON 按节点 id 继承。"""
+    base_pos: dict[str, tuple[float, float]] = {}
+    if base:
+        for arr in (base.get("ivrData") or {}).values():
+            if not isinstance(arr, list):
+                continue
+            for nd in arr:
+                if not isinstance(nd, dict) or not nd.get("id"):
+                    continue
+                try:
+                    base_pos[str(nd["id"])] = (float(nd.get("x") or 0), float(nd.get("y") or 0))
+                except (TypeError, ValueError):
+                    pass
+    preserved: dict[str, tuple[float, float]] = {}
+    id_of = ids or {}
+    for n in design.nodes:
+        if n.pos:
+            preserved[n.no] = n.pos
+            continue
+        nid = id_of.get(n.no)
+        if nid and nid in base_pos:
+            preserved[n.no] = base_pos[nid]
+    return preserved
+
+
+def build_layout_model(design: Design) -> _LayoutModel:
+    """按画布 manualLayoutOrder.ts 走主干 + 分支组 + 离散节点。
+
+    主干 = 从开始节点沿「第一出边」走，直到某个节点出边 ≥4（意图菜单）或走到已访问节点。
+    其余出边延后成分支组，绕圈用 visited 收敛。
     """
     by_no = design.by_no
-    succ: dict[str, list[str]] = {}
-    for n in design.nodes:
-        outs = [b.target for b in canvas_branch_list(n) if b.target]
-        if n.next:
-            outs.append(n.next)
-        succ[n.no] = [t for t in outs if t in by_no]
+    succ = {n.no: node_outgoing(n, by_no) for n in design.nodes}
+    incoming: dict[str, list[str]] = {}
+    for src, targets in succ.items():
+        for tgt in targets:
+            bucket = incoming.setdefault(tgt, [])
+            if src not in bucket:
+                bucket.append(src)
 
-    roots = [n.no for n in design.nodes if n.kind == "start"] + \
-            [n.no for n in design.nodes if n.is_global]
-    # BFS 最短层（流程允许成环，必须用 visited 收敛，不能算最长路）
-    layer: dict[str, int] = {}
-    queue: list[tuple[str, int]] = [(r, 0) for r in roots]
-    head = 0
-    while head < len(queue):
-        no, lv = queue[head]
-        head += 1
-        if no in layer:
+    start = next((n.no for n in design.nodes if n.kind == "start"), None)
+    if start is None and design.nodes:
+        start = design.nodes[0].no
+
+    visited: set[str] = set()
+    queued: set[str] = set()
+    main_chain: list[str] = []
+    branch_groups: list[_BranchGroup] = []
+    group_map: dict[str, _BranchGroup] = {}
+    meta: dict[str, _LayoutMeta] = {}
+    branch_queue: list[tuple[str, str, int, str, bool]] = []
+
+    def group_of(parent_id: str) -> _BranchGroup:
+        existed = group_map.get(parent_id)
+        if existed:
+            return existed
+        grp = _BranchGroup(parent_id=parent_id)
+        group_map[parent_id] = grp
+        branch_groups.append(grp)
+        return grp
+
+    def append_node(no: str, info: _LayoutMeta) -> bool:
+        if no not in by_no or no in visited:
+            return False
+        visited.add(no)
+        meta[no] = info
+        return True
+
+    def queue_branch(parent_id: str, target: str, branch_index: int,
+                     root_parent: str, track_root: bool) -> None:
+        grp = group_of(root_parent)
+        if track_root and target not in grp.root_ids:
+            grp.root_ids.append(target)
+        if target not in grp.ordered_ids:
+            grp.ordered_ids.append(target)
+        if target in visited or target in queued:
+            return
+        queued.add(target)
+        branch_queue.append((target, parent_id, branch_index, root_parent, track_root))
+
+    def visit_chain(first: str, *, is_main: bool, parent: str | None,
+                    branch_index: int, root_parent: str | None, depth: int) -> None:
+        current: str | None = first
+        parent_id = parent
+        d = depth
+        while current and append_node(current, _LayoutMeta(
+            parent=parent_id, depth=d, branch_index=branch_index,
+            is_main=is_main,
+        )):
+            if is_main:
+                main_chain.append(current)
+            elif root_parent:
+                grp = group_of(root_parent)
+                if current not in grp.ordered_ids:
+                    grp.ordered_ids.append(current)
+            outs = succ.get(current, [])
+            stop_menu = len(outs) >= BRANCH_MENU_EDGE_THRESHOLD
+            branch_edges = outs if stop_menu else outs[1:]
+            for i, tgt in enumerate(branch_edges):
+                queue_branch(
+                    current, tgt, i,
+                    current if stop_menu else (root_parent or current),
+                    (not root_parent) or stop_menu,
+                )
+            nxt = None if stop_menu else (outs[0] if outs else None)
+            if not nxt or nxt not in by_no or nxt in visited:
+                break
+            parent_id = current
+            current = nxt
+            d += 1
+
+    def drain_branches() -> None:
+        while branch_queue:
+            node_id, parent_id, bidx, root_parent, _track = branch_queue.pop(0)
+            parent_depth = meta[parent_id].depth if parent_id in meta else 0
+            visit_chain(node_id, is_main=False, parent=parent_id,
+                        branch_index=bidx, root_parent=root_parent,
+                        depth=parent_depth + 1)
+
+    if start:
+        visit_chain(start, is_main=True, parent=None,
+                    branch_index=0, root_parent=None, depth=0)
+        drain_branches()
+
+    def orphan_rank(no: str) -> int:
+        if any(t in visited for t in succ.get(no, [])):
+            return 2
+        if any(no in ts and src in visited for src, ts in succ.items()):
+            return 2
+        return 1 if succ.get(no) else 0
+
+    orphan_ids: list[str] = []
+    for n in design.nodes:
+        if n.no in visited:
             continue
-        layer[no] = lv
-        for t in succ.get(no, []):
-            if t not in layer:
-                queue.append((t, lv + 1))
-    max_lv = max(layer.values()) if layer else 0
-    for n in design.nodes:
-        layer.setdefault(n.no, max_lv + 1)
+        rank = orphan_rank(n.no)
+        if not append_node(n.no, _LayoutMeta(
+            is_main=False, is_orphan=True, orphan_rank=rank,
+        )):
+            continue
+        orphan_ids.append(n.no)
+        for i, tgt in enumerate(succ.get(n.no, [])):
+            if tgt not in visited or meta.get(tgt, _LayoutMeta()).is_orphan:
+                queue_branch(n.no, tgt, i, n.no, True)
+        drain_branches()
 
+    return _LayoutModel(main_chain=main_chain, branch_groups=branch_groups,
+                        meta=meta, orphan_ids=orphan_ids, incoming=incoming)
+
+
+def visual_box(n: Node, xy: tuple[float, float]) -> tuple[float, float, float, float]:
+    """G6 绘制盒：原点在静态 172×260 的中心，节点向下长出真实高度。"""
+    x, y = xy
+    left = x - NODE_W / 2
+    top = y - STATIC_H_HALF
+    return left, top, left + NODE_W, top + estimate_node_height(n)
+
+
+def boxes_overlap(a: tuple[float, float, float, float],
+                  b: tuple[float, float, float, float],
+                  gap: float = MIN_VERTICAL_GAP) -> bool:
+    l1, t1, r1, b1 = a
+    l2, t2, r2, b2 = b
+    return not (r1 + gap <= l2 or r2 + gap <= l1 or b1 + gap <= t2 or b2 + gap <= t1)
+
+
+def _place_if_free(pos: dict[str, tuple[float, float]], fixed: set[str],
+                   no: str, x: float, y: float) -> tuple[float, float]:
+    if no in pos and no in fixed:
+        return pos[no]
+    pos[no] = (x, y)
+    return x, y
+
+
+def _place_branch_descendants(
+    no: str, x: float, y: float, model: _LayoutModel,
+    pos: dict[str, tuple[float, float]], fixed: set[str],
+) -> None:
+    children = [
+        (m.branch_index, child)
+        for child, m in model.meta.items()
+        if m.parent == no and not m.is_main
+    ]
+    children.sort()
+    for _, child in children:
+        cx, cy = _place_if_free(pos, fixed, child, x + COLUMN_GAP, y)
+        _place_branch_descendants(child, cx, cy, model, pos, fixed)
+
+
+def _balanced_menu_rows(count: int, row_gap: float) -> int:
+    if count <= 0:
+        return 1
+    balanced = max(1, int(-(-((count * (COLUMN_GAP / max(row_gap, 1))) ** 0.5) // 1)))
+    return max(1, min(BRANCH_MENU_MAX_ROWS, count, balanced))
+
+
+def _place_branch_menu_grid(
+    parent_x: float, parent_y: float, roots: list[str],
+    heights: dict[str, float], model: _LayoutModel,
+    pos: dict[str, tuple[float, float]], fixed: set[str],
+) -> None:
+    row_gap = (heights[roots[0]] if roots else H_DEFAULT) + BRANCH_GAP
+    row_count = _balanced_menu_rows(len(roots), row_gap)
+    for index, root in enumerate(roots):
+        col = index // row_count
+        row = index % row_count
+        rows_in_col = min(row_count, len(roots) - col * row_count)
+        x = parent_x + COLUMN_GAP + col * COLUMN_GAP
+        y = parent_y + (row - (rows_in_col - 1) / 2) * (heights[root] + BRANCH_GAP)
+        rx, ry = _place_if_free(pos, fixed, root, x, y)
+        _place_branch_descendants(root, rx, ry, model, pos, fixed)
+
+
+def _place_branch_column(
+    parent_x: float, parent_y: float, roots: list[str],
+    heights: dict[str, float], model: _LayoutModel,
+    pos: dict[str, tuple[float, float]], fixed: set[str],
+) -> None:
+    total_h = sum(heights[r] for r in roots) + max(len(roots) - 1, 0) * BRANCH_GAP
+    cursor_y = parent_y - total_h / 2
+    branch_x = parent_x + COLUMN_GAP
+    for root in roots:
+        y = cursor_y + heights[root] / 2
+        rx, ry = _place_if_free(pos, fixed, root, branch_x, y)
+        _place_branch_descendants(root, rx, ry, model, pos, fixed)
+        cursor_y += heights[root] + BRANCH_GAP
+
+
+def _place_orphan_forest(
+    model: _LayoutModel, heights: dict[str, float],
+    pos: dict[str, tuple[float, float]], fixed: set[str],
+) -> None:
+    if not model.orphan_ids or not model.main_chain:
+        return
+    order_map = {no: i for i, no in enumerate(model.orphan_ids)}
+    roots = [no for no in model.orphan_ids if no in heights]
+    roots.sort(key=lambda no: (
+        -(model.meta[no].orphan_rank if no in model.meta else 0),
+        order_map.get(no, 0),
+    ))
+    start_x = min(pos[no][0] for no in model.main_chain if no in pos)
+    main_h = max((heights[no] for no in model.main_chain), default=H_DEFAULT)
+    baseline_y = pos[model.main_chain[0]][1] if model.main_chain[0] in pos else ORIGIN_Y
+    top_y = baseline_y + main_h / 2 + ORPHAN_FOREST_SAFE_Y_GAP
+
+    def is_detached_leaf(no: str) -> bool:
+        m = model.meta.get(no)
+        if not m or not m.is_orphan or m.orphan_rank > 0:
+            return False
+        return not any(
+            g.parent_id == no or no in g.ordered_ids for g in model.branch_groups
+        )
+
+    has_connected = any(not is_detached_leaf(no) for no in roots)
+    detached = [no for no in roots if is_detached_leaf(no)] if has_connected else []
+    regular = [no for no in roots if not is_detached_leaf(no)] if has_connected else roots
+
+    def place_in_columns(items: list[str], origin_x: float, columns: int) -> None:
+        if not items:
+            return
+        cursors = [top_y] * columns
+        for no in items:
+            col = min(range(columns), key=lambda i: cursors[i])
+            _place_if_free(
+                pos, fixed, no,
+                origin_x + col * COLUMN_GAP,
+                cursors[col] + heights[no] / 2,
+            )
+            cursors[col] += heights[no] + BRANCH_GAP
+
+    place_in_columns(regular, start_x, ORPHAN_FOREST_COLUMNS)
+    place_in_columns(
+        detached,
+        start_x - COLUMN_GAP * DETACHED_LEAF_PARKING_COLUMNS,
+        DETACHED_LEAF_PARKING_COLUMNS,
+    )
+
+
+def _place_merge_nodes(
+    model: _LayoutModel, pos: dict[str, tuple[float, float]], locked: set[str],
+) -> None:
+    protected = {
+        rid
+        for g in model.branch_groups
+        if len(g.root_ids) >= BRANCH_MENU_EDGE_THRESHOLD
+        for rid in g.root_ids
+    }
+    for no, preds in model.incoming.items():
+        if (no in locked or no in protected or no in model.main_chain
+                or len(preds) < MERGE_NODE_MIN_INCOMING):
+            continue
+        current = pos.get(no)
+        incoming_pos = [pos[p] for p in preds if p in pos]
+        if not current or len(incoming_pos) < MERGE_NODE_MIN_INCOMING:
+            continue
+        right = [p for p in incoming_pos if p[0] > current[0]]
+        if len(right) <= len(incoming_pos) / 2:
+            continue
+        ys = sorted(p[1] for p in incoming_pos)
+        mid = ys[len(ys) // 2] if len(ys) % 2 else (ys[len(ys) // 2 - 1] + ys[len(ys) // 2]) / 2
+        pos[no] = (max(p[0] for p in incoming_pos) + COLUMN_GAP, mid)
+
+
+def _resolve_column_collisions(
+    design: Design, model: _LayoutModel, heights: dict[str, float],
+    pos: dict[str, tuple[float, float]], fixed: set[str],
+) -> None:
+    """同列按 G6 视觉盒推开。主干尽量保持水平；`--base` / 手写坐标绝不移动。"""
+    by_no = design.by_no
     order = {n.no: i for i, n in enumerate(design.nodes)}
-    groups: dict[int, list[str]] = {}
-    for no, lv in layer.items():
-        groups.setdefault(lv, []).append(no)
-    pos: dict[str, tuple[float, float]] = {}
-    for lv in sorted(groups):
-        cursor = ORIGIN_Y
-        for no in sorted(groups[lv], key=lambda k: order[k]):
-            n = by_no[no]
-            if n.pos:                       # decompile 带回来的原坐标，原样保留
-                pos[no] = n.pos
-                continue
-            pos[no] = (ORIGIN_X + lv * LAYER_GAP, cursor)
-            cursor += estimate_node_height(n) + ROW_GAP
+    columns: list[list[str]] = []
+    for no in sorted(pos, key=lambda k: (pos[k][0], pos[k][1], order.get(k, 0))):
+        x = pos[no][0]
+        if columns and abs(x - pos[columns[-1][0]][0]) <= VERTICAL_LANE_X_TOLERANCE:
+            columns[-1].append(no)
+        else:
+            columns.append([no])
+
+    for col in columns:
+        items = [{
+            "no": no,
+            "y": pos[no][1],
+            "h": heights[no],
+            "fixed": no in fixed,
+            "sticky": no in fixed or no in model.main_chain,
+            "bidx": model.meta[no].branch_index if no in model.meta else order.get(no, 0),
+            "idx": order.get(no, 0),
+        } for no in col if no in by_no]
+
+        def sort_key(it: dict[str, Any]) -> tuple:
+            return (it["y"], it["bidx"], it["idx"])
+
+        for _ in range(len(items) + 2):
+            items.sort(key=sort_key)
+            changed = False
+            for i in range(1, len(items)):
+                prev, cur = items[i - 1], items[i]
+                min_y = prev["y"] + prev["h"] + MIN_VERTICAL_GAP
+                if cur["y"] >= min_y:
+                    continue
+                if not cur["sticky"]:
+                    cur["y"] = min_y
+                    changed = True
+                    continue
+                if not prev["sticky"]:
+                    prev["y"] = cur["y"] - prev["h"] - MIN_VERTICAL_GAP
+                    for j in range(i - 1, 0, -1):
+                        upper, lower = items[j - 1], items[j]
+                        need = lower["y"] - upper["h"] - MIN_VERTICAL_GAP
+                        if upper["y"] <= need or upper["sticky"]:
+                            break
+                        upper["y"] = need
+                    changed = True
+                    continue
+                if not cur["fixed"]:
+                    cur["y"] = min_y
+                    changed = True
+                    continue
+                if not prev["fixed"]:
+                    prev["y"] = cur["y"] - prev["h"] - MIN_VERTICAL_GAP
+                    for j in range(i - 1, 0, -1):
+                        upper, lower = items[j - 1], items[j]
+                        need = lower["y"] - upper["h"] - MIN_VERTICAL_GAP
+                        if upper["y"] <= need or upper["fixed"]:
+                            break
+                        upper["y"] = need
+                    changed = True
+            if not changed:
+                break
+        for it in items:
+            x, _ = pos[it["no"]]
+            pos[it["no"]] = (x, it["y"])
+
+
+def layout(design: Design, ids: dict[str, str] | None = None,
+           base: dict[str, Any] | None = None,
+           relayout: bool = False) -> dict[str, tuple[float, float]]:
+    """按流程顺序排版：主干从左到右，分支在父节点右侧纵向展开，同列不重叠。
+
+    算法对齐画布「一键整理」（manualLayoutOrder + manualLayoutHumanize +
+    manualLayoutCollision）。节点高度用 estimate_node_height() 估算。
+    默认存量节点坐标取 --base JSON 的 x/y（md 不维护坐标）；分片里若仍写了
+    `- 坐标:`（旧稿）则仍尊重。`--relayout` 时忽略旧坐标，全部按流程重排。
+    """
+    if not design.nodes:
+        return {}
+    by_no = design.by_no
+    heights = {n.no: estimate_node_height(n) for n in design.nodes}
+    model = build_layout_model(design)
+    preserved = {} if relayout else _collect_preserved_pos(design, ids, base)
+    pos: dict[str, tuple[float, float]] = dict(preserved)
+    locked = set(preserved)
+
+    for i, no in enumerate(model.main_chain):
+        if no in pos:
+            locked.add(no)
+            continue
+        if i == 0:
+            _place_if_free(pos, locked, no, ORIGIN_X, ORIGIN_Y)
+        else:
+            px, py = pos.get(model.main_chain[i - 1], (ORIGIN_X, ORIGIN_Y))
+            _place_if_free(pos, locked, no, px + COLUMN_GAP, py)
+        locked.add(no)
+
+    _place_orphan_forest(model, heights, pos, locked)
+
+    large_menu_owner: dict[str, str] = {}
+    for grp in model.branch_groups:
+        if len(grp.root_ids) < BRANCH_MENU_EDGE_THRESHOLD:
+            continue
+        for rid in grp.root_ids:
+            large_menu_owner.setdefault(rid, grp.parent_id)
+
+    for grp in model.branch_groups:
+        parent_pos = pos.get(grp.parent_id)
+        if not parent_pos:
+            continue
+        roots = [
+            rid for rid in grp.root_ids
+            if rid in by_no
+            and rid not in locked
+            and large_menu_owner.get(rid, grp.parent_id) == grp.parent_id
+        ]
+        if not roots:
+            continue
+        if len(roots) >= BRANCH_MENU_EDGE_THRESHOLD:
+            _place_branch_menu_grid(
+                parent_pos[0], parent_pos[1], roots, heights, model, pos, locked)
+        else:
+            _place_branch_column(
+                parent_pos[0], parent_pos[1], roots, heights, model, pos, locked)
+
+    _place_merge_nodes(model, pos, locked)
+    for n in design.nodes:
+        if n.no not in pos:
+            pos[n.no] = (ORIGIN_X, ORIGIN_Y)
+    _resolve_column_collisions(design, model, heights, pos, set(preserved))
     return pos
-
-
-STATIC_H_HALF = 86              # 画布以静态 nodeStyle.height(172) 的一半做绘制原点
 
 
 def branch_anchor_dy(kind: str, anchor: int) -> float:
@@ -1150,7 +1808,7 @@ def _edge(src_key: str, tgt_key: str, source_id: str, target_id: str,
 
 
 def build_json(design: Design, base: dict[str, Any] | None = None,
-               rewrap: bool = True) -> dict[str, Any]:
+               rewrap: bool = True, relayout: bool = False) -> dict[str, Any]:
     """rewrap=True 时把话术里的排版硬折行合回一行（--base 保真模式下调用方会关掉）。"""
     if rewrap:
         design.rewrap_stats = 0
@@ -1169,16 +1827,16 @@ def build_json(design: Design, base: dict[str, Any] | None = None,
                 if nd.get("id"):
                     base_by_id[nd["id"]] = nd
 
-    ids: dict[str, str] = {}
-    for n in design.nodes:
-        ids[n.no] = n.node_id or node_id_of(n.no, n.name)
-    pos = layout(design)
+    ids = resolve_node_ids(design, base)
+    design.node_ids = ids
+    pos = layout(design, ids=ids, base=base, relayout=relayout)
 
     ivr: dict[str, list[dict[str, Any]]] = {}
     for n in design.nodes:
         nid = ids[n.no]
         bnode = base_by_id.get(nid)
-        _normalize_branches(n)
+        for w in _normalize_branches(n):
+            design.notes.append((n.key, w))
         _resolve_branch_ids(n, bnode)
         node_data = _node_data(n, design, nid,
                                 (bnode or {}).get("nodeData", {}).get("vars"))
@@ -1194,9 +1852,18 @@ def build_json(design: Design, base: dict[str, Any] | None = None,
                 merged["collectionConfig"] = bcc      # 收集项 id 属于服务端资源，原样保留
             node_data = merged
 
+        if n.kind in ("chat", "announce") and not _listens(n):
+            node_data.pop("replyMode", None)
+
         cbrs = canvas_branch_list(n)
         edges: list[dict[str, Any]] = []
-        if n.kind in MULTI_EXIT_KINDS and not (n.kind == "chat" and not _listens(n)):
+        # 没有回复分类时按单出口生成（source=节点 id），不能走多出口分支循环。
+        use_multi = (
+            n.kind in MULTI_EXIT_KINDS
+            and bool(cbrs)
+            and not (n.kind == "chat" and not _listens(n))
+        )
+        if use_multi:
             for i, b in enumerate(cbrs):
                 if not b.target:
                     continue
@@ -1210,7 +1877,7 @@ def build_json(design: Design, base: dict[str, Any] | None = None,
                 etype = "custom:cubic-horizontal" if n.kind in ("chat", "announce") else ""
                 edges.append(_edge(
                     f"{n.key}:next", by_no[tgt].key, nid, ids[tgt],
-                    pos[n.no], pos[tgt], 1, etype, None,
+                    pos[n.no], pos[tgt], 1, etype, None, n.kind,
                 ))
 
         node = {
@@ -1240,15 +1907,6 @@ def build_json(design: Design, base: dict[str, Any] | None = None,
     return {"version": VERSION, "ivrData": ivr, "voiceSettings": vs}
 
 
-def _listens(n: Node) -> bool:
-    """chat 节点是否听用户回复（外部 JSON 的 selectBranch == 内部 listenUserReply）。"""
-    if n.kind == "announce":
-        return False
-    if n.a("听用户回复") is not None:
-        return _to_bool(n.a("听用户回复"))
-    return bool([b for b in n.branches if b.kind != "global_intent"])
-
-
 def _mk_branch(b: Branch) -> dict[str, Any]:
     return {
         "id": b.bid,
@@ -1273,7 +1931,7 @@ def _node_data(n: Node, d: Design, nid: str,
     if k in ("chat", "announce"):
         listens = _listens(n)
         var = n.a("收集变量")
-        content_mode = n.a("话术模式", "固定" if k == "announce" else "智能生成")
+        content_mode = n.a("话术模式", "智能生成")
         data: dict[str, Any] = {
             "welcomeText": n.prompt,
             "content": n.prompt,
@@ -1615,8 +2273,12 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
         typ = n.get("type")
         edges = n.get("outEdges") or []
         is_global = bool(nd.get("globalNode"))
+        chat_canvas_br = [
+            b for b in (nd.get("branches") or []) if b.get("type") != "global_intent"
+        ] if typ == "chatNode" else []
+        # 没配意图分支时仍是单出口（source=节点 id），不论 selectBranch
         single = typ in ("startNode", "extractVariableNode") or (
-            typ == "chatNode" and not nd.get("selectBranch"))
+            typ == "chatNode" and (not nd.get("selectBranch") or not chat_canvas_br))
         terminal = typ in ("hangup", "transfer", "transferAgentNode")
 
         # E3 单出口 / 终点
@@ -1645,11 +2307,39 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
                     add("error", "E4", name,
                         f"连线 source={e.get('source')} 不在本节点分支 id 列表里")
 
-        # E7 全局节点必须有非空 global_intent
+        # E18 同一节点内分支 id 必须唯一。条件节点的保留字 else 只能给否则分支。
+        # 重复 id 会让导入按 branchId 反查锚点时把多条出边叠到第一个匹配分支上。
+        branch_objs: list[dict[str, Any]] = []
+        for key in ("branches", "logicSplitBranches", "workTimeBranches"):
+            branch_objs.extend(nd.get(key) or [])
+        bid_count: dict[str, int] = {}
+        for b in branch_objs:
+            bid = str(b.get("id") or "")
+            if not bid:
+                continue
+            bid_count[bid] = bid_count.get(bid, 0) + 1
+        for bid, cnt in bid_count.items():
+            if cnt > 1:
+                add("error", "E18", name,
+                    f"分支 id 重复：{bid} 出现 {cnt} 次。导入后同 id 的出边会叠到同一个锚点")
+        if typ == "logicSplitNode":
+            for b in nd.get("logicSplitBranches") or []:
+                if str(b.get("id")) == "else" and b.get("logicType") != "else":
+                    add("error", "E18", name,
+                        "非否则分支占用了保留 id「else」，导入后否则分支的连线会错接到该分支")
+                ncond = len(b.get("conditions") or [])
+                if ncond > LOGIC_SPLIT_BRANCH_CONDITION_MAX:
+                    bn = b.get("name") or b.get("content") or b.get("id")
+                    add("error", "E19", name,
+                        f"分支「{bn}」{_over_limit_branch_conditions_msg(ncond)}")
+
+        # E7 听回复的全局对话节点必须有非空 global_intent。
+        # 纯播报全局节点（selectBranch=false）线上允许没有触发语：存量画布会把
+        # 孤立节点标成全局，只为通过「必须连入主路」校验。
         if is_global and typ == "chatNode":
             gi = [b for b in (nd.get("branches") or [])
                   if b.get("type") == "global_intent" and str(b.get("content") or "").strip()]
-            if not gi:
+            if not gi and nd.get("selectBranch") and chat_canvas_br:
                 add("error", "E7", name, "全局节点必须至少有一条非空的全局触发语（global_intent）")
 
         # E8 分支 content 非空
@@ -1725,9 +2415,26 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
                 if any(e.get("slotId") for e in ents):
                     add("warn", "W8", name,
                         "实体带了 slotId，若不是从真实环境导出的请删除，否则会指向不存在的服务端词槽")
-            if nd.get("selectBranch") and not [
-                    b for b in (nd.get("branches") or []) if b.get("type") != "global_intent"]:
-                add("error", "E14", name, "listenUserReply=true（selectBranch）但没有任何分支")
+            if any(b.get("type") == "entity_fail" for b in (nd.get("branches") or [])):
+                add("error", "E17", name,
+                    "branches 含已废弃的 entity_fail。画布导入后会剥掉该分支，后续连线锚点全部错位")
+            types = [b.get("type") for b in chat_canvas_br]
+            if "entity_success" in types:
+                si = types.index("entity_success")
+                first_class = next(
+                    (i for i, t in enumerate(types) if t in ("intent", "else", "silent")), None)
+                if first_class is not None and si > first_class:
+                    add("error", "E17", name,
+                        "entity_success 必须排在意图分类之前，否则导入后连线会错到错误的分支锚点")
+            if "silent" in types:
+                last_silent = max(i for i, t in enumerate(types) if t == "silent")
+                if any(t in ("intent", "else", "entity_success")
+                       for t in types[last_silent + 1:]):
+                    add("error", "E17", name,
+                        "silent 必须排在意图分类之后（画布把无应答垫在分类组末尾）")
+            if nd.get("selectBranch") and not chat_canvas_br:
+                add("warn", "W12", name,
+                    "selectBranch=true 但没有回复分类，线上编辑会勾选「用户回复分类」并报错")
             if nd.get("contentType") not in ("gen", "fix"):
                 add("error", "E15", name,
                     f"contentType 只能是 gen 或 fix，实际是 {nd.get('contentType')!r}（注意不是 fixed）")
@@ -1888,11 +2595,14 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
 
     # 话术三段结构
     if design:
+        for where, msg in design.notes:
+            add("warn", "W13", where, msg)
         for nd_ in design.nodes:
             st = (nd_.a("词槽类型") or "").strip()
             if nd_.a("收集变量") and st and st != "custom":
                 add("warn", "W14", nd_.key,
                     f"词槽类型只支持 custom，已按 custom 处理（原稿是 {st!r}）")
+        for nd_ in design.nodes:
             if nd_.kind == "chat" and nd_.prompt:
                 miss = [s for s in ("目标", "参考示例", "应对策略") if s not in nd_.prompt]
                 if miss:
@@ -1987,7 +2697,8 @@ def _kind_of(node: dict[str, Any]) -> str:
     t = node.get("type")
     nd = node.get("nodeData") or {}
     if t == "chatNode":
-        return "chat" if nd.get("selectBranch") else "announce"
+        canvas_br = [b for b in (nd.get("branches") or []) if b.get("type") != "global_intent"]
+        return "chat" if nd.get("selectBranch") and canvas_br else "announce"
     if t == "DTMFNode":
         return "dtmf-nav" if nd.get("nodeType") == "navigation" else "dtmf-collect"
     if t == "transfer":
@@ -1996,7 +2707,76 @@ def _kind_of(node: dict[str, Any]) -> str:
     return TYPE_TO_KIND.get(t, "chat")
 
 
-def decompile(flow: dict[str, Any], title: str = "") -> str:
+ID_ATTR_RE = re.compile(r"^-\s*ID\s*[:：]\s*(\S+)\s*$")
+NODE_NO_TOKEN_RE = re.compile(r"^N\d+$", re.I)
+
+
+def assign_node_nos(order: list[Any], override: dict[str, str] | None = None) -> dict[Any, str]:
+    """按节点 id 沿用已有 Nxx；新节点从空号补。避免 BFS 重排把整棵 src 的编号和互引一起改掉。"""
+    ov = {str(k): str(v) for k, v in (override or {}).items()}
+    mapped: dict[Any, str] = {}
+    used: set[str] = set()
+    for nid in order:
+        label = ov.get(str(nid))
+        if label and NODE_NO_TOKEN_RE.match(label) and label not in used:
+            mapped[nid] = label
+            used.add(label)
+    nxt = 1
+
+    def alloc() -> str:
+        nonlocal nxt
+        while f"N{nxt:02d}" in used:
+            nxt += 1
+        n = f"N{nxt:02d}"
+        used.add(n)
+        nxt += 1
+        return n
+
+    return {nid: mapped.get(nid) or alloc() for nid in order}
+
+
+def load_nos_from_src(src_dir: Path) -> dict[str, str]:
+    """从已有 src 分片读 id→Nxx。有 `- ID:` 用显式 id，否则用编号+名称派生的稳定 id。"""
+    out: dict[str, str] = {}
+    if not src_dir.is_dir():
+        return out
+    for f in sorted(src_dir.rglob("*.md")):
+        text = f.read_text(encoding="utf-8")
+        header: tuple[str, str] | None = None
+        nid: str | None = None
+        for line in text.splitlines():
+            s = line.strip()
+            if header is None:
+                m = NODE_HEADER.match(s)
+                if m:
+                    header = (m.group(1), m.group(2).strip())
+                continue
+            m = ID_ATTR_RE.match(s)
+            if m:
+                nid = m.group(1)
+                break
+        if not header:
+            continue
+        no, name = header
+        out[nid or node_id_of(no, name)] = no
+    return out
+
+
+def load_keep_nos(args: argparse.Namespace) -> dict[str, str]:
+    out: dict[str, str] = {}
+    src = getattr(args, "keep_nos_from", None)
+    if src:
+        out.update(load_nos_from_src(Path(src)))
+    path = getattr(args, "keep_nos", None)
+    if path:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            out.update({str(k): str(v) for k, v in raw.items()})
+    return out
+
+
+def decompile(flow: dict[str, Any], title: str = "",
+              nos_by_id: dict[str, str] | None = None) -> str:
     ivr = flow.get("ivrData") or {}
     nodes = [n for arr in ivr.values() for n in arr]
     by_id = {n.get("id"): n for n in nodes}
@@ -2016,7 +2796,7 @@ def decompile(flow: dict[str, Any], title: str = "") -> str:
     for n in nodes:
         if n["id"] not in order:
             order.append(n["id"])
-    no_of = {nid: f"N{i + 1:02d}" for i, nid in enumerate(order)}
+    no_of = assign_node_nos(order, nos_by_id)
 
     vs = flow.get("voiceSettings") or {}
     out: list[str] = [f"# 流程：{title or '未命名流程'}", ""]
@@ -2028,6 +2808,8 @@ def decompile(flow: dict[str, Any], title: str = "") -> str:
             val = vs[fld]
             if isinstance(val, bool):
                 val = "是" if val else "否"
+            elif fld in ("maxDuration", "notifyDuration") and isinstance(val, (int, float)) and val >= 1000:
+                val = int(round(val / 1000))
             elif isinstance(val, list):
                 val = ", ".join(str(x) for x in val)
             out.append(f"- {zh}: {val}")
@@ -2080,7 +2862,6 @@ def decompile(flow: dict[str, Any], title: str = "") -> str:
         gl = " {全局}" if nd.get("globalNode") else ""
         out.append(f"### {no_of[nid]} {n.get('name')} [{kind}]{gl}")
         out.append(f"- ID: {nid}")
-        out.append(f"- 坐标: {round(float(n.get('x', 0)), 1)},{round(float(n.get('y', 0)), 1)}")
         out += _decompile_attrs(kind, nd)
         prompt = nd.get("welcomeText") or nd.get("content") or ""
         if kind in ("chat", "announce") and prompt:
@@ -2101,19 +2882,23 @@ def _decompile_attrs(kind: str, nd: dict[str, Any]) -> list[str]:
                     f"{x.get('tagName')}={x.get('tagValue')}" for x in b["tags"]) + "}"
             a.append(f"- 触发: {_esc(b.get('content') or '')}{tp}")
     if kind in ("chat", "announce"):
-        a.append(f"- 话术模式: {'固定' if nd.get('contentType') == 'fix' else '智能生成'}")
-        a.append(f"- 允许打断: {'是' if nd.get('allowInterrupt') else '否'}")
+        # 「智能生成」一律不写（chat / announce 默认相同）。「固定」必须写出。
+        if nd.get("contentType") == "fix":
+            a.append("- 话术模式: 固定")
+        if nd.get("allowInterrupt"):
+            a.append("- 允许打断: 是")
         if nd.get("silentWaitTime") is not None:
             a.append(f"- 静默等待(秒): {nd['silentWaitTime']}")
         if nd.get("verifyEntity"):
             a.append("- 校验实体: 是")
         for e in nd.get("entities") or []:
-            a.append(f"- 收集变量: {e.get('varName', '')}")
-            a.append("- 词槽类型: custom")
+            var = e.get("varName", "")
+            a.append(f"- 收集变量: {var}")
             if e.get("slotId") is not None:
                 a.append(f"- 词槽ID: {e['slotId']}")
-            if e.get("name"):
-                a.append(f"- 词槽名称: {e['name']}")
+            name = e.get("name") or ""
+            if name and name != var:
+                a.append(f"- 词槽名称: {name}")
             if e.get("description"):
                 a.append("- 词槽说明: " + _esc(e["description"]))
             if e.get("collectionMode") is not None:
@@ -2121,9 +2906,16 @@ def _decompile_attrs(kind: str, nd: dict[str, Any]) -> list[str]:
             if e.get("fixedOptions"):
                 a.append(f"- 固定选项: {_esc(e['fixedOptions'])}")
     elif kind == "api":
-        a.append(f"- URL: {nd.get('url', '')}")
-        a.append(f"- 超时(毫秒): {nd.get('callbackTimeout', 4500)}")
-        a.append(f"- 异步: {'是' if nd.get('async') else '否'}")
+        if nd.get("url"):
+            a.append(f"- URL: {nd.get('url', '')}")
+        try:
+            timeout = int(nd.get("callbackTimeout", 4500))
+        except (TypeError, ValueError):
+            timeout = 4500
+        if timeout != 4500:
+            a.append(f"- 超时(毫秒): {timeout}")
+        if nd.get("async"):
+            a.append("- 异步: 是")
         if nd.get("retryTimes"):
             a.append(f"- 重试次数: {nd['retryTimes']}")
         for h in nd.get("headerParams") or []:
@@ -2140,15 +2932,35 @@ def _decompile_attrs(kind: str, nd: dict[str, Any]) -> list[str]:
             else:
                 a.append(f"- 变量: {v.get('name')} = 固定值: {_esc(v.get('value', ''))}")
     elif kind == "worktime":
-        a.append(f"- 时区: {nd.get('timeZoneName', 'Asia/Shanghai')}")
+        tz = nd.get("timeZoneName") or "Asia/Shanghai"
+        if tz != "Asia/Shanghai":
+            a.append(f"- 时区: {tz}")
     elif kind in ("dtmf-nav", "dtmf-collect"):
         cfg = (nd.get("tcccNodeData") or {}).get("dtmfConfig") or {}
-        a.append("- 话术: " + str(cfg.get("play_sound", "")).replace("tts:", ""))
-        a.append(f"- 超时(毫秒): {cfg.get('dtmf_timeout', 5000)}")
-        a.append(f"- 失败次数: {cfg.get('max_failures', 1)}")
+        sound = str(cfg.get("play_sound", "")).replace("tts:", "")
+        if sound:
+            a.append("- 话术: " + sound)
+        try:
+            dto = int(cfg.get("dtmf_timeout", 5000))
+        except (TypeError, ValueError):
+            dto = 5000
+        if dto != 5000:
+            a.append(f"- 超时(毫秒): {dto}")
+        try:
+            fails = int(cfg.get("max_failures", 1))
+        except (TypeError, ValueError):
+            fails = 1
+        if fails != 1:
+            a.append(f"- 失败次数: {fails}")
         if kind == "dtmf-collect":
-            a.append(f"- 收集变量: {nd.get('varName', '')}")
-            a.append(f"- 位数: {cfg.get('dtmf_len', 1)}")
+            if nd.get("varName"):
+                a.append(f"- 收集变量: {nd.get('varName', '')}")
+            try:
+                dlen = int(cfg.get("dtmf_len", 1))
+            except (TypeError, ValueError):
+                dlen = 1
+            if dlen != 1:
+                a.append(f"- 位数: {dlen}")
     elif kind.startswith("transfer-") and kind != "transfer-agent":
         if nd.get("name"):
             a.append(f"- 技能组ID: {nd['name']}")
@@ -2170,32 +2982,97 @@ def _decompile_attrs(kind: str, nd: dict[str, Any]) -> list[str]:
         if (nd.get("aiTransferContext") or {}).get("enableSummary"):
             a.append("- 转人工带摘要: 是")
     elif kind == "transfer-agent":
-        a.append(f"- 智能体ID: {nd.get('varAgentID', '')}")
+        if nd.get("varAgentID"):
+            a.append(f"- 智能体ID: {nd.get('varAgentID', '')}")
     return a
+
+
+def _canvas_branch_dicts(kind: str, nd: dict[str, Any]) -> list[dict[str, Any]]:
+    """画布出锚点对应的分支列表（chat 要剔除 global_intent）。"""
+    if kind == "condition":
+        return list(nd.get("logicSplitBranches") or [])
+    if kind == "worktime":
+        return list(nd.get("workTimeBranches") or [])
+    raw = list(nd.get("branches") or [])
+    if kind == "chat":
+        return [b for b in raw if b.get("type") != "global_intent"]
+    return raw
+
+
+def _branch_edge_targets(n: dict[str, Any]) -> dict[str, str]:
+    """分支 id -> 目标节点 id。
+
+    兼容两种 JSON：
+    - 本工具编译：source / edgeData.branchId = 分支 id
+    - TCCC 控制台导出：source = 节点 id，靠 startPoint.anchorIndex 或 edgeData.branchId 对应分支
+    """
+    nd = n.get("nodeData") or {}
+    nid = str(n.get("id") or "")
+    blist = _canvas_branch_dicts(_kind_of(n), nd)
+    out: dict[str, str] = {}
+    for e in n.get("outEdges") or []:
+        t = str(e.get("target") or "")
+        if not t:
+            continue
+        src = str(e.get("source") or "")
+        bid = (e.get("edgeData") or {}).get("branchId")
+        if bid:
+            out[str(bid)] = t
+        if src and src != nid:
+            out[src] = t
+        if src == nid or not src:
+            anchor = (e.get("startPoint") or {}).get("anchorIndex")
+            if isinstance(anchor, int) and 1 <= anchor <= len(blist):
+                b = blist[anchor - 1]
+                if b.get("id"):
+                    out[str(b["id"])] = t
+    return out
+
+
+def _fmt_operator(op: Any) -> str:
+    token = str(op or "").strip()
+    return OP_ZH.get(token, token)
+
+
+def _fmt_condition(c: dict[str, Any]) -> str:
+    left = str(c.get("var") or "").strip()
+    op = _fmt_operator(c.get("operator"))
+    if str(c.get("operator") or "").strip() in UNARY_OPS:
+        return f"{left} {op}".strip()
+    return f"{left} {op} {c.get('val', '')}".strip()
 
 
 def _decompile_branches(kind: str, n: dict[str, Any], no_of: dict[str, str],
                         by_id: dict[str, Any]) -> list[str]:
     nd = n.get("nodeData") or {}
+    nid = str(n.get("id") or "")
     edges = n.get("outEdges") or []
     tgt_by_src: dict[str, str] = {}
     for e in edges:
         tgt_by_src[str(e.get("source"))] = str(e.get("target"))
+    tgt_by_bid = _branch_edge_targets(n)
 
     def arrow(bid: str) -> str:
-        t = tgt_by_src.get(str(bid))
+        t = tgt_by_bid.get(str(bid)) or tgt_by_src.get(str(bid))
         if not t or t not in by_id:
             return ""
         return f" → {no_of[t]} {by_id[t].get('name')}"
 
+    def next_line(tid: str | None) -> list[str]:
+        if not tid or tid not in by_id:
+            return []
+        return [f"→ {no_of[tid]} {by_id[tid].get('name')}"]
+
     out: list[str] = []
     if kind in ("start", "announce", "assign"):
-        t = tgt_by_src.get(str(n.get("id")))
-        if t and t in by_id:
-            out.append(f"→ {no_of[t]} {by_id[t].get('name')}")
-        return out
+        return next_line(tgt_by_src.get(nid))
     if kind in TERMINAL_KINDS:
         return out
+
+    canvas = _canvas_branch_dicts(kind, nd)
+    if kind == "chat" and not canvas:
+        tid = tgt_by_src.get(nid) or (str(edges[0].get("target") or "") if edges else "")
+        return next_line(tid)
 
     out.append("分支：")
     if kind == "condition":
@@ -2206,9 +3083,7 @@ def _decompile_branches(kind: str, n: dict[str, Any], no_of: dict[str, str],
                 out.append(f"- 如果 LLM: {b.get('llmPrompt', '')}{arrow(b.get('id'))}")
             else:
                 joiner = " 或 " if b.get("logicType") == "or" else " 且 "
-                expr = joiner.join(
-                    f"{c.get('var')} {c.get('operator')} {c.get('val', '')}".strip()
-                    for c in b.get("conditions") or [])
+                expr = joiner.join(_fmt_condition(c) for c in b.get("conditions") or [])
                 out.append(f"- 如果 {expr}{arrow(b.get('id'))}")
     elif kind == "worktime":
         for b in nd.get("workTimeBranches") or []:
@@ -2237,13 +3112,15 @@ def _decompile_branches(kind: str, n: dict[str, Any], no_of: dict[str, str],
     else:
         for b in nd.get("branches") or []:
             t = b.get("type")
-            c = str(b.get("content") or "")
+            c = _branch_text(b.get("content") or "")
             tagpart = ""
             if b.get("tags"):
                 tagpart = " {标签: " + "; ".join(
                     f"{x.get('tagName')}={x.get('tagValue')}" for x in b["tags"]) + "}"
             if t == "global_intent":
                 continue
+            elif t == "entity_fail":
+                continue  # 画布已废弃，不写回设计稿
             elif t == "entity_success":
                 out.append(f"- 收集成功{tagpart}{arrow(b.get('id'))}")
             elif t == "api_call_success":
@@ -2278,14 +3155,15 @@ def _decompile_branches(kind: str, n: dict[str, Any], no_of: dict[str, str],
 #   src/
 #   ├── 00-流程信息.md        # `# 流程：xxx` 标题 + 模块说明
 #   ├── 10-环境配置.md        # ## 环境配置
-#   ├── 20-假设与待确认.md    # 任意其它 ## 章节，一章一文件，原样透传
+#   ├── 20-假设与待确认.md    # 任意其它 ## 章节，一章一文件，原样透传（JSON 没有这一章也要占 20）
 #   ├── 30-全局提示词.md      # ## 全局提示词，整篇一个文件（systemPrompt 本来就是一整块）
 #   ├── 40-变量表.md
-#   └── 50-节点/              # 一个节点一个文件，文件名就是节点编号
-#       ├── N01-开始通话.md
-#       └── N02-开场问题识别.md
+#   └── 50-节点/              # 一个节点一个文件，文件名是节点名
+#       ├── 开始通话.md
+#       └── 开场问题识别.md
 #
-# 章节按数字前缀排，节点按编号数值排（N9 在 N10 前，与文件树的自然排序一致）。
+# 章节按数字前缀排。节点文件名不再带 Nxx（编号只写在正文 `### Nxx 名称 [kind]` 里，
+# 连线也只认正文编号）。合并节点章节时按正文编号数值排，与文件名、子目录无关。
 # 只有节点是拆片的（几十上百个），章节一律一章一文件。目录角色靠目录名识别
 # （节点/nodes；全局提示词/prompt 目录仅为兼容手工拆片保留），认不出来时嗅探首行是不是
 # `### Nxx …`。合并 = 按序拼接，不做任何语义加工，所以 split → assemble 是无损往返。
@@ -2299,6 +3177,16 @@ NODES_DIR_ALIASES = {"节点", "nodes", "node"}
 PROMPT_DIR_ALIASES = {"全局提示词", "prompt", "prompts", "systemprompt", "system-prompt"}
 FNAME_BAD_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff_]+")
 
+# 约定序号：某一章缺失时仍占用这个号。线上 JSON 没有「假设与待确认」，
+# 若按出现顺序 10/20/30… 编号，「用线上覆盖」会把 50-节点/ 整目录改成 40-节点/。
+CANONICAL_SECTION_SEQ = {
+    "环境配置": 10,
+    "假设与待确认": 20,
+    "全局提示词": 30,
+    "变量表": 40,
+    "节点": 50,
+}
+
 
 def _safe_name(s: str, limit: int = 32) -> str:
     """把章节名/节点名压成安全文件名：保留中文与字母数字，其它一律换成 -。"""
@@ -2306,23 +3194,139 @@ def _safe_name(s: str, limit: int = 32) -> str:
     return (out[:limit].rstrip("-") or "未命名")
 
 
+def _canonical_section_seq(title: str) -> int | None:
+    t = title.replace(" ", "")
+    if t.startswith("节点"):
+        return CANONICAL_SECTION_SEQ["节点"]
+    return CANONICAL_SECTION_SEQ.get(t)
+
+
+def _next_section_seq(last: int, used: set[int], upcoming: set[int]) -> int:
+    """未登记章节：能插进与下一约定章之间的空隙就插，否则往后排。"""
+    nxt = min(upcoming) if upcoming else None
+    cand = last + 10
+    if nxt is None or cand < nxt:
+        while cand in used and (nxt is None or cand < nxt):
+            cand += 10
+        if cand not in used and (nxt is None or cand < nxt):
+            return cand
+    if nxt is not None:
+        for n in range(last + 1, nxt):
+            if n not in used:
+                return n
+    cand = last + 10
+    blocked = used | upcoming
+    while cand in blocked:
+        cand += 10
+    return cand
+
+
 def _strip_seq(name: str) -> str:
     return SEQ_PREFIX_RE.sub("", name)
 
 
 def _src_sort_key(p: Path) -> tuple[int, int, str]:
-    """排序：数字前缀（章节）在前，`Nxx` 节点编号在后，都按**数值**比而不是字典序。
-
-    按数值比是为了 `N9` 排在 `N10` 前面——这也是 Finder / IDE 文件树的自然排序口径，
-    所以文件树里看到的顺序就是合并稿里的顺序。
-    """
+    """章节/子目录：数字前缀按数值排；其余按文件名。节点正文编号不走这里。"""
     m = SEQ_PREFIX_RE.match(p.name)
     if m:
         return (0, int(m.group(1)), p.name)
-    m = NODE_SEQ_RE.match(p.name)
-    if m:
-        return (1, int(m.group(1)), p.name)
-    return (2, 0, p.name)
+    return (1, 0, p.name)
+
+
+def _node_header_from_text(text: str) -> tuple[str, str] | None:
+    for line in text.splitlines():
+        m = NODE_HEADER.match(line.strip())
+        if m:
+            return (m.group(1), m.group(2).strip())
+    return None
+
+
+def _peek_node_header(p: Path) -> tuple[str, str] | None:
+    try:
+        return _node_header_from_text(p.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+
+
+def _node_no_value(no: str) -> int:
+    m = NODE_SEQ_RE.match(no)
+    return int(m.group(1)) if m else 0
+
+
+def _node_file_stem(no: str, name: str, used: set[str]) -> str:
+    """节点文件名用节点名；同目录重名时追加 -Nxx。"""
+    base = _safe_name(name)
+    stems = [base, f"{base}-{no}"]
+    n = 2
+    while True:
+        for stem in stems:
+            fname = f"{stem}.md"
+            if fname not in used:
+                used.add(fname)
+                return stem
+        stems = [f"{base}-{no}-{n}"]
+        n += 1
+
+
+def _sort_node_src_files(files: list[Path]) -> list[Path]:
+    """节点目录内：说明类（数字前缀）在前，节点按正文 `### Nxx` 数值排。"""
+    def key(p: Path) -> tuple[int, int, str]:
+        header = _peek_node_header(p)
+        if header:
+            return (1, _node_no_value(header[0]), p.name)
+        m = SEQ_PREFIX_RE.match(p.name)
+        if m:
+            return (0, int(m.group(1)), p.name)
+        return (2, 0, p.name)
+    return sorted(files, key=key)
+
+
+def _print_renames(moved: list[tuple[Path, Path]], base: Path) -> None:
+    if not moved:
+        return
+    print(f"[重命名] {len(moved)} 个节点分片改为按节点名命名")
+    for old, new in moved[:20]:
+        print(f"  {rel_path(old, base)} → {rel_path(new, base)}")
+    if len(moved) > 20:
+        print(f"  … 另 {len(moved) - 20} 个")
+
+
+def normalize_node_filenames(src_dir: Path) -> list[tuple[Path, Path]]:
+    """把旧的 `Nxx-名称.md`（以及改名后未跟上的文件）改成 `名称.md`。"""
+    if not src_dir.is_dir():
+        return []
+    by_dir: dict[Path, list[tuple[Path, str, str]]] = {}
+    reserved: dict[Path, set[str]] = {}
+    for f in src_dir.rglob("*.md"):
+        if f.name.startswith("."):
+            continue
+        header = _peek_node_header(f)
+        if header:
+            by_dir.setdefault(f.parent, []).append((f, header[0], header[1]))
+        else:
+            reserved.setdefault(f.parent, set()).add(f.name)
+    moved: list[tuple[Path, Path]] = []
+    for d, items in by_dir.items():
+        used = set(reserved.get(d, ()))
+        plan: list[tuple[Path, str]] = []
+        for p, no, name in items:
+            plan.append((p, f"{_node_file_stem(no, name, used)}.md"))
+        need = [(p, fname) for p, fname in plan if p.name != fname]
+        if not need:
+            continue
+        temps: list[tuple[Path, Path, Path]] = []
+        for p, fname in need:
+            tmp = p.with_name(f"{p.stem}.__renaming__{p.suffix}")
+            n = 2
+            while tmp.exists():
+                tmp = p.with_name(f"{p.stem}.__renaming__{n}{p.suffix}")
+                n += 1
+            p.rename(tmp)
+            temps.append((tmp, d / fname, p))
+        for tmp, dest, orig in temps:
+            tmp.rename(dest)
+            moved.append((orig, dest))
+    return moved
 
 
 def _src_entries(d: Path) -> list[Path]:
@@ -2398,6 +3402,7 @@ def assemble_src(src_dir: Path) -> tuple[str, list[tuple[Path | None, int]]]:
         files = _iter_src_md(p)
         if role == "nodes":
             saw_nodes = True
+            files = _sort_node_src_files(files)
             em.add("## 节点")
             em.blank()
             for f in files:
@@ -2475,11 +3480,13 @@ def _split_nodes(body: list[str]) -> list[tuple[str, str]]:
         raise DesignError("「## 节点」章节里没有解析到任何节点（节点标题格式：### N01 名称 [kind]）")
 
     out: list[tuple[str, str]] = []
+    used: set[str] = set()
     if [x for x in pre if x.strip()]:
+        used.add("000-节点说明.md")
         out.append(("000-节点说明.md", "\n".join(pre).strip("\n") + "\n"))
     for no, name, lines in chunks:
-        # 文件名直接用节点编号：文件树按编号正序排，改 N45 就找 N45-*.md
-        out.append((f"{no}-{_safe_name(name)}.md", "\n".join(lines).strip("\n") + "\n"))
+        fname = f"{_node_file_stem(no, name, used)}.md"
+        out.append((fname, "\n".join(lines).strip("\n") + "\n"))
     return out
 
 
@@ -2512,17 +3519,63 @@ def split_design(text: str) -> list[tuple[str, str]]:
     head_txt = re.sub(r"\n{3,}", "\n\n", head_txt)     # 去掉 banner 留下的空行
     files.append(("00-流程信息.md", (head_txt or "# 流程：未命名流程") + "\n"))
 
-    seq = 0
+    used = {0}
+    last = 0
+    upcoming = {n for t, _ in sections if (n := _canonical_section_seq(t)) is not None}
     for title, body in sections:
-        seq += 10
+        canon = _canonical_section_seq(title)
+        upcoming.discard(canon)
+        if canon is not None and canon not in used:
+            n = canon
+        else:
+            n = _next_section_seq(last, used, upcoming)
+        used.add(n)
+        last = n
         t = title.replace(" ", "")
         if t.startswith("节点"):
-            d = f"{seq:02d}-节点"
-            files += [(f"{d}/{n}", c) for n, c in _split_nodes(body)]
+            d = f"{n:02d}-节点"
+            files += [(f"{d}/{x}", c) for x, c in _split_nodes(body)]
         else:
-            files.append((f"{seq:02d}-{_safe_name(title)}.md",
+            files.append((f"{n:02d}-{_safe_name(title)}.md",
                           f"## {title}\n\n" + "\n".join(body).strip("\n") + "\n"))
     return files
+
+
+def patch_node_id_markdown(text: str, nid: str) -> str:
+    """在节点分片标题下写入或更新 `- ID:`，已是同一 id 则不动。"""
+    lines = text.replace("\r\n", "\n").split("\n")
+    hi = next((i for i, line in enumerate(lines) if NODE_HEADER.match(line.strip())), None)
+    if hi is None:
+        return text
+    new_line = f"- ID: {nid}"
+    id_i = next((i for i, line in enumerate(lines) if ID_ATTR_RE.match(line.strip())), None)
+    if id_i is not None:
+        cur = ID_ATTR_RE.match(lines[id_i].strip())
+        if cur and cur.group(1) == nid:
+            return text
+        lines[id_i] = new_line
+        return "\n".join(lines)
+    lines.insert(hi + 1, new_line)
+    return "\n".join(lines)
+
+
+def backfill_src_node_ids(src_dir: Path, ids: dict[str, str]) -> int:
+    """把编译得到的节点 id 写回 src 分片。返回改动文件数。"""
+    changed = 0
+    for f in src_dir.rglob("*.md"):
+        text = f.read_text(encoding="utf-8")
+        header = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        m = NODE_HEADER.match(header)
+        if not m:
+            continue
+        nid = ids.get(m.group(1))
+        if not nid:
+            continue
+        new = patch_node_id_markdown(text, nid)
+        if new != text:
+            f.write_text(new, encoding="utf-8")
+            changed += 1
+    return changed
 
 
 def write_src(files: list[tuple[str, str]], target: Path, force: bool = False) -> list[Path]:
@@ -2603,7 +3656,8 @@ def cmd_build(args: argparse.Namespace) -> int:
     md_out: Path | None = None
     proj = src.resolve().parent
     if src.is_dir():
-        # src/ 分片模式：先就地修分片的硬折行，再合并成整篇设计稿
+        # src/ 分片模式：先把旧 Nxx- 文件名迁到节点名，再就地修硬折行，再合并
+        _print_renames(normalize_node_filenames(src), proj)
         if rewrap:
             merged, changed = rewrap_files(_iter_src_md(src))
             if merged:
@@ -2622,7 +3676,7 @@ def cmd_build(args: argparse.Namespace) -> int:
     except DesignError as e:
         raise DesignError(remap_src_lines(str(e), origin, proj) if origin else str(e)) from None
 
-    flow = build_json(design, base, rewrap=rewrap)
+    flow = build_json(design, base, rewrap=rewrap, relayout=bool(getattr(args, "relayout", False)))
     issues = validate(flow, design)
     if origin:                       # 问题位置带上源文件，便于直接打开修改
         # 校验里的位置有两种写法：设计稿口径「N02 采集运单号」和 JSON 口径「采集运单号」
@@ -2664,6 +3718,10 @@ def cmd_build(args: argparse.Namespace) -> int:
         md_out.write_text(body, encoding="utf-8")
         print(f"[设计稿] {md_out}  （由 {src}/ 合并生成）")
     out.write_text(json.dumps(flow, ensure_ascii=False, indent=2), encoding="utf-8")
+    if src.is_dir() and getattr(args, "write_src_ids", False) and design.node_ids:
+        n_ids = backfill_src_node_ids(src, design.node_ids)
+        if n_ids:
+            print(f"[回填] 写入 {n_ids} 个节点 ID 到 src 分片")
     n_nodes = sum(len(v) for v in flow["ivrData"].values())
     n_edges = sum(len(n["outEdges"]) for v in flow["ivrData"].values() for n in v)
     print(f"[OK] {out}  节点 {n_nodes} / 连线 {n_edges} / "
@@ -2681,8 +3739,9 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 def cmd_split(args: argparse.Namespace) -> int:
     src = Path(args.design)
+    keep = load_keep_nos(args)
     if src.suffix.lower() == ".json":
-        text = decompile(_load_json(str(src)), args.title or src.stem)
+        text = decompile(_load_json(str(src)), args.title or src.stem, nos_by_id=keep)
     else:
         text = src.read_text(encoding="utf-8")
     files = split_design(text)
@@ -2701,6 +3760,7 @@ def cmd_split(args: argparse.Namespace) -> int:
 
 def cmd_assemble(args: argparse.Namespace) -> int:
     src = Path(args.src)
+    _print_renames(normalize_node_filenames(src), src)
     text, _ = assemble_src(src)
     out = Path(args.output) if args.output else src.parent / f"{src.parent.name}-设计稿.md"
     out.write_text(text, encoding="utf-8")
@@ -2728,7 +3788,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 def cmd_decompile(args: argparse.Namespace) -> int:
     flow = _load_json(args.flow)
-    md = decompile(flow, args.title or Path(args.flow).stem)
+    md = decompile(flow, args.title or Path(args.flow).stem, nos_by_id=load_keep_nos(args))
     out = Path(args.output or Path(args.flow).with_suffix(".md"))
     out.write_text(md, encoding="utf-8")
     print(f"[OK] {out}")
@@ -2775,6 +3835,8 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--emit-md", help="合并稿输出路径；传目录时默认 <父目录名>-设计稿.md")
     b.add_argument("--no-emit-md", action="store_true", help="只出 JSON，不写合并稿 md")
     b.add_argument("--base", help="已导出的真实画布 JSON，作为 voiceSettings / 未表达字段的底座")
+    b.add_argument("--relayout", action="store_true",
+                   help="忽略 --base / 旧稿坐标，按流程顺序重新排版（应用编译默认开启）")
     b.add_argument("--report", help="额外把校验结果落成 markdown 报告（默认只打终端）")
     b.add_argument("--mermaid")
     b.add_argument("--force", action="store_true", help="即使有 error 也写出 JSON（仅调试用）")
@@ -2782,6 +3844,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="把话术里的排版硬折行合回一行（不带 --base 时默认开启）")
     b.add_argument("--no-rewrap", dest="rewrap", action="store_false",
                    help="保留话术里的换行原样不动")
+    b.add_argument("--write-src-ids", action="store_true",
+                   help="把编译得到的节点 id 写回 src 分片的 `- ID:`（发布时用，预览不要加）")
     b.set_defaults(func=cmd_build)
 
     sp = sub.add_parser("split", help="整篇设计稿 / 画布 JSON -> src/ 分片目录")
@@ -2789,6 +3853,8 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("-o", "--output", help="src 目录，默认 <设计稿同级>/src")
     sp.add_argument("--title", help="输入是 JSON 时的流程名")
     sp.add_argument("--force", action="store_true", help="目标目录已有分片时覆盖（先删旧 md）")
+    sp.add_argument("--keep-nos-from", help="已有 src 目录，按节点 id 沿用其中的 Nxx 编号")
+    sp.add_argument("--keep-nos", help="id→Nxx 的 JSON 文件，覆盖/补充 --keep-nos-from")
     sp.set_defaults(func=cmd_split)
 
     asm = sub.add_parser("assemble", help="src/ 分片目录 -> 整篇设计稿 md（不编译 JSON）")
@@ -2812,6 +3878,8 @@ def main(argv: list[str] | None = None) -> int:
     dcp.add_argument("flow")
     dcp.add_argument("-o", "--output")
     dcp.add_argument("--title")
+    dcp.add_argument("--keep-nos-from", help="已有 src 目录，按节点 id 沿用其中的 Nxx 编号")
+    dcp.add_argument("--keep-nos", help="id→Nxx 的 JSON 文件")
     dcp.set_defaults(func=cmd_decompile)
 
     args = ap.parse_args(argv)

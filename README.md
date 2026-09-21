@@ -20,7 +20,7 @@
 - [支持的节点类型](#支持的节点类型)
 - [校验编码全表](#校验编码全表)
 - [两种典型工作流](#两种典型工作流)
-- [十条红线](#十条红线)
+- [红线](#红线)
 - [目录结构](#目录结构)
 - [常见问题](#常见问题)
 - [维护须知](#维护须知)
@@ -46,7 +46,7 @@
 
 skill 装在 `~/.workbuddy/skills/skill-tccc-flow/`，在 WorkBuddy 会话里会自动加载。
 
-命令行直接用的话只需要一个 Python 3.9+：
+命令行直接用的话只需要一个 Python 3.9+（无需 `pip install`，无需 node）：
 
 ```bash
 PY=/Users/lizhenwen/.workbuddy/binaries/python/versions/3.13.12/bin/python3
@@ -54,8 +54,6 @@ SK=~/.workbuddy/skills/skill-tccc-flow
 
 $PY $SK/scripts/tccc_flow.py --help
 ```
-
-无需 `pip install`，无需 node。
 
 ---
 
@@ -74,9 +72,9 @@ $PY $SK/scripts/tccc_flow.py build /tmp/我的流程/src
 [设计稿] /tmp/我的流程/我的流程-设计稿.md  （由 /tmp/我的流程/src/ 合并生成）
 [OK] /tmp/我的流程/我的流程.json  节点 13 / 连线 22 / error 0 / warn 3
 [warn] 3 项
-  W5 采集运单号（src/50-节点/N02-采集运单号.md）：悬空分支（命中后会重复本节点）：客户在报单号但还没说完…
-  W5 告知进度并确认工单（src/50-节点/N05-告知进度并确认工单.md）：悬空分支（命中后会重复本节点）：客户询问派送网点电话…
-  W1 转技能组（src/50-节点/N12-转技能组.md）：技能组 id 为空，导入不报错但画布保存时会提示「请选择技能组」
+  W5 采集运单号（src/50-节点/采集运单号.md）：悬空分支（命中后会重复本节点）：客户在报单号但还没说完…
+  W5 告知进度并确认工单（src/50-节点/告知进度并确认工单.md）：悬空分支（命中后会重复本节点）：客户询问派送网点电话…
+  W1 转技能组（src/50-节点/转技能组.md）：技能组 id 为空，导入不报错但画布保存时会提示「请选择技能组」
 ```
 
 校验结果只打终端、不落盘（同类问题多了会按编码聚合）；确实要留档时加 `--report 报告.md`。
@@ -116,6 +114,7 @@ tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
 | `build src`（传目录） | 产物路径按 **src 的父目录名**自动取：`<父目录名>-设计稿.md` / `<父目录名>.json`；同时就地修分片的硬折行 |
 | `--emit-md` / `--no-emit-md` | 合并稿输出路径 / 不输出合并稿（只要 JSON） |
 | `--base` | 传一份**已从画布导出的真实 JSON** 当底座。md 里没表达的字段逐字继承，节点 id / 分支 id / 词槽 slotId 全部保留，改动范围可控 |
+| `--relayout` | 忽略底座/旧稿坐标，按流程主干+分支重新排版 |
 | `--report` | 额外把校验结果落成 markdown 报告。**默认不落盘**，校验结果只打终端 |
 | `--mermaid` | 额外导出一份 mermaid 流程图（`flowchart LR`） |
 | `--force` | `build` 时有 error 也强行写出 JSON（仅调试用）；`split` 时覆盖已存在的 src 分片 |
@@ -136,18 +135,18 @@ tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
 │   ├── 20-假设与待确认.md        # 其它 ## 章节：一章一文件，原样透传
 │   ├── 30-全局提示词.md          # ## 全局提示词，整篇一个文件（systemPrompt 是一整块，不拆）
 │   ├── 40-变量表.md
-│   └── 50-节点/                  # 一个节点一个文件，文件名就是节点编号
-│       ├── N01-开始通话.md
-│       ├── N02-开场问题识别.md
-│       └── N03-采集错误代码.md
+│   └── 50-节点/                  # 一个节点一个文件，文件名是节点名
+│       ├── 开始通话.md
+│       ├── 开场问题识别.md
+│       └── 采集错误代码.md
 ├── 5881-售后处理流程-设计稿.md   ← build 产物：整篇合并稿，别手改
 └── 5881-售后处理流程.json        ← build 产物：导入画布用
 ```
 
 - **只有节点是拆片的**（一个流程几十上百个节点），章节一律一章一文件。
-- 章节按**数字前缀**排，节点按**编号数值**排（`N9` < `N10` < `N117`）。按数值比而不是字典序，
-  和 Finder / IDE 文件树的自然排序一致——文件树里看到的顺序就是合并稿的顺序。
-- 加节点就用编号命名，编号按它在流程里的位置取；要改 N45 就打开 `N45-*.md`。
+- 章节按**数字前缀**排。节点文件名是 `<节点名>.md`（重名才加 `-Nxx`）；
+  合并按正文 `### Nxx` 编号数值排，和文件名无关。
+- 加节点用节点名命名，正文编号按它在流程里的位置取；要改某节点就打开同名 md。
 - 目录角色按名字识别：`节点`/`nodes`；认不出时嗅探首行是不是 `### Nxx …`。
 - 合并只是按序拼接，不做任何语义加工，所以 `split` → `assemble` 是**逐字节无损往返**。
 - 校验结果里每条问题都标了出问题的 src 文件名，可以直接打开改。
@@ -210,7 +209,7 @@ tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
 ### N04 判断状态 [condition]
 分支：
 - 如果 ${快件状态} == 3 → N06 已签收说明
-- 如果 ${预计送达时间} exists → N05 告知进度
+- 如果 ${预计送达时间} 存在 → N05 告知进度
 - 否则 → N10 转人工前告知
 ```
 
@@ -261,16 +260,18 @@ tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
 | E4 | 多出口节点的连线 source 必须是本节点某个分支 id；连线目标必须存在 |
 | E5 | 除开始节点与全局节点外，每个节点必须有入边 |
 | E6 | 所有节点必须从开始节点或某个全局节点可达 |
-| E7 | 全局节点必须至少一条非空 `global_intent` 触发语 |
+| E7 | 听用户回复的全局对话节点必须至少一条非空 `global_intent` 触发语（纯播报全局节点不强制，线上存量常见） |
 | E8 | `intent` / `global_intent` 分支 content 不能为空 |
 | E9 | 条件判断 / 工时判断 / DTMF 的分支必须全部连线 |
 | E10 | 一个对话节点只能收 1 个变量；配了词槽必须有 `entity_success` 分支且 `replyMode=intent_with_entity` |
 | E11 | 引用的 `${变量}` 必须有来源（接口返回 / 赋值 / 词槽 / 收号 / 环境注入变量） |
 | E12 | 字数上限：全局提示词 8192 / 节点话术 5000 / 单条回复分类 300 / 变量描述 1000 / 播报类短文本 300 / 静默提示与挂机话术 100 / 变量名与词槽名 50（超了画布静默截断，赋值节点则是保存硬拦） |
 | E13 | 单出口节点不能连自己 |
-| E14 | `selectBranch=true` 的对话节点必须有分支 |
 | E15 | `contentType` 只能是 `gen` 或 `fix` |
 | E16 | 工时判断的 `dayType` 只能是 `BusinessDay`/`Holiday`/`Custom`/`CustomDate`；`Custom` 必须带 `daysOfWeek`，`CustomDate` 必须带 `specificDates`；必须有「其他时间」兜底分支；非大陆时区不能用法定工作日/休息日 |
+| E17 | 词槽节点禁止 `entity_fail`；`entity_success` 必须排在意图分类之前，`silent` 必须垫底（否则导入后连线错位） |
+| E18 | 同一节点内分支 id 必须唯一；条件判断的保留字 `else` 只能给否则分支（否则导入后出边会叠到错误锚点） |
+| E19 | 条件判断节点单条分支的 `conditions` 不得超过 30（运行时硬上限，超了每次经过该节点都触发超限检测） |
 | W1 | 环境相关 id 待补（技能组 / 智能体 / 接口 URL / 音色） |
 | W2 | 单节点分支数 > 12，意图识别精度会下降 |
 | W3 | 全局节点超过 3 个，会污染所有节点的意图识别 |
@@ -282,6 +283,8 @@ tccc_flow.py rewrap 设计稿.md|目录 [--dry-run] [-v]
 | W9 | 长度到了 E12 某条上限的 90%，提前预警 |
 | W10 | `systemPrompt` 里引用了流程内部变量（词槽/接口/赋值产生），应挪到对应节点话术 |
 | W11 | 话术里「一句话没写完就换行」，排版换行会原样进 JSON 发给大模型（build 默认自动合并） |
+| W12 | `selectBranch=true` 但没有回复分类（线上编辑会勾选「用户回复分类」并报错） |
+| W13 | 设计稿写了「收集失败」，已忽略（画布已废弃该分支） |
 | W14 | 词槽类型只支持 custom，已按 custom 处理 |
 
 报告末尾还会附一份「导入后人工验收清单」。
@@ -334,7 +337,7 @@ $PY $SK/scripts/tccc_flow.py build 5881-我的流程/src --base /tmp/base.json
 
 ---
 
-## 十条红线
+## 红线
 
 来自画布源码，违反必翻车（详细出处见 `references/canvas-rules.md`）：
 
@@ -348,6 +351,7 @@ $PY $SK/scripts/tccc_flow.py build 5881-我的流程/src --base /tmp/base.json
 8. `maxDuration` / `notifyDuration` 用**秒**，导入时画布自己 ×1000，不要预先换算。
 9. `aiBotId` 导入时被强制覆盖成当前机器人 id，不用管。
 10. 画布允许成环，可以放心让分支回到上游节点。
+11. 条件判断节点单条分支最多 **30** 个条件。超了运行时每次经过都触发超限检测；拆成级联判断节点。
 
 ---
 
@@ -379,7 +383,7 @@ skill-tccc-flow/
 拆成分片后一个节点一个文件，改动范围一眼可见，多人/多 agent 并行改也不会互相踩。
 如果确实需要一份整篇的稿子给人看，就是 build 出来的那份。
 
-**Q：已经有一份大设计稿了，怎么迁到 `src/`？**`split 设计稿.md -o src`，然后把老设计稿挪进 `参考材料/历史版本/`。
+**Q：已经有一份大设计稿了，怎么迁到 `src/`？**`split 设计稿.md -o src`，然后删掉根目录那份老设计稿（下次 build 会重新生成合并稿）。
 `split` → `assemble` 是逐字节无损的，迁完 `build src --base 上一版.json` 出来的 JSON 与迁移前完全一致（三诺 61 节点项目实测 0 差异）。
 
 **Q：为什么节点 id 每次编译都一样？**基于「节点编号 + 节点名」做 SHA1 派生，所以只要不改名，重编译 id 不变，diff 干净。
@@ -390,8 +394,8 @@ decompile 会把原 id 写成 `- ID:` 属性，`--base` 靠它精确匹配。
 **Q：为什么不默认给每个对话节点加 else 兜底？**`else` 是系统分支（导入后画布上不可编辑），而且会抢走本该命中具体意图的回复。
 未命中已经会重复本节点，无应答由 `静默提示` + `静默提示次数` 兜底。线上真实画布也是这么做的。
 
-**Q：坐标怎么算的？会不会重叠？**BFS 分层：主干水平推进（层距 440px），同层纵向堆叠。节点高度不是拍脑袋估的，而是
-**1:1 移植了画布自己的几何估算器** `src/flow/utils/manualLayoutNodeSizeEstimate.ts`（「一键整理」用的就是这套常量）。核心规律：
+**Q：坐标怎么算的？会不会重叠？**对齐画布「一键整理」：从开始节点沿第一出边走主干（水平推进，层距 420px），其余分支在父节点右侧按锚点展开；出边 ≥4 的意图菜单不再把第一出口误判成主干。同列按 G6 视觉盒推开，间隙 ≥16px。节点高度
+**1:1 移植了画布自己的几何估算器** `src/flow/utils/manualLayoutNodeSizeEstimate.ts`。核心规律：
 
 ```
 对话节点高度 = 24 + 36 + 108 + 分支区 + (全局节点再 +46)
@@ -399,12 +403,13 @@ decompile 会把原 id 写成 `- ID:` 属性，`--base` 靠它精确匹配。
 ```
 
 所以 2 分支节点 284px、16 分支节点 1012px，纵向间距会跟着分支数自动放大。
-`--base` 模式下存量节点保留原坐标，只给新节点排位。导入后点一次画布「整理」效果更好。
+`--base` 默认保留存量坐标（改已导入画布时不乱跑）。想按流程顺序整体重排就加 `--relayout`，避免旧坐标和新节点叠在一起。
 
 **Q：词槽要不要填 slotId？**新建流程**不要填**。自定义词槽会写一个临时 id，保存时画布调 `updateAISlot` 自动建槽并回填真实 slotId。
 只有在复用真实环境已存在的词槽时（通常来自 decompile）才会带 `- 词槽ID:`。
 
-**Q：词槽类型写什么？**只写 `custom`（可省略）。不要写 date/name 等：账号词槽目录不认这些 type，发布时也同步不上去。
+**Q：条件判断一条分支写了几十个「或」会怎样？**
+单条分支最多 30 个条件（E19）。超过会在运行时每次经过该节点都触发超限检测。拆成级联判断节点：第一个最多 30 个条件命中走目标，`否则` 接到下一个判断节点继续匹配。
 
 **Q：词槽类型写什么？**只写 `custom`（可省略）。不要写 date/name 等：账号词槽目录不认这些 type，发布时也同步不上去。
 
@@ -424,14 +429,21 @@ decompile 会把原 id 写成 `- ID:` 属性，`--base` 靠它精确匹配。
 | 常量 | 对应源码 |
 |---|---|
 | `DEFAULT_VOICE_SETTINGS` | 画布 `voiceSettings` 默认值 |
-| `SYSTEM_PROMPT_MAX` | `persona-requirements.vue` 的 `MAX_PROMPT_LENGTH` |
+| `SYSTEM_PROMPT_MAX` | `persona-requirements.vue` 的 `MAX_PROMPT_LENGTH`（8192） |
+| `CHAT_PROMPT_MAX` / `REPLY_CLASS_MAX` | `utils/const.ts` 的 `MAX_WELCOME_LENGTH`（5000）/ `MAX_REPLY_LENGTH`（300） |
+| `VAR_DESC_MAX` / `VAR_NAME_MAX` | `voice-variable-assign-node.validation.ts` 的 `MAX_FIELD_LENGTH`（1000）/ `MAX_VARIABLE_NAME_LENGTH`（50）；词槽同口径见 `entity-management-modal.vue` |
+| `TTS_TEXT_MAX` / `NOTIFY_TEXT_MAX` | 转接与 DTMF 各段播报话术的 `maxlength`（300）/ `no-response-settings.vue` 的静默提示与结束语（100） |
+| `LOGIC_SPLIT_BRANCH_CONDITION_MAX` | 逻辑条件判断节点单条分支 `conditions` 上限 30（运行时超限检测） |
 | `VALID_VAD_LEVELS` | `validateXGraph.ts` 的 vadLevel 校验 |
 | `SYSTEM_BRANCH_TYPES` | `VoiceReplyType` 枚举 |
 | `DEFAULT_TRANSFER_MUSIC` / `DEFAULT_AI_TRANSFER_CONTEXT` | `node/TCCC.ts` 的转接节点默认值 |
 | 节点高度常量（`LABEL_H` / `WELCOME_H` / `BRANCH_ITEM_H` / `GLOBAL_TIPS_H` …）与 `estimate_node_height()` | `flow/utils/manualLayoutNodeSizeEstimate.ts`（画布「一键整理」的几何估算器）；样式改了这里必须同步，否则自动布局会重叠 |
+| 自动布局（主干 / 分支组 / 同列防重叠） | `flow/utils/manualLayoutOrder.ts` + `manualLayoutHumanize.ts` + `manualLayoutCollision.ts` |
 | 校验规则 | `flow/validate/validateFlowDataOnSave.ts` + `validateXGraph.ts` |
 
-回归自测（改完脚本务必跑一遍）：
+回归自测（改完脚本务必跑一遍）：先跑单测
+`$PY $SK/scripts/tccc_flow_roundtrip.test.py && $PY $SK/scripts/tccc_flow_layout.test.py`，
+再手动过一遍真实画布往返：
 
 ```bash
 # 1. 从零编译示例
