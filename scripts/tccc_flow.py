@@ -2201,6 +2201,34 @@ def _clean_var_names(names: Any) -> set[str]:
     return out
 
 
+ASSUM_MAX_CHARS = 200        # 单条假设正文字数（规范要求 ≤150，留 50 字缓冲再报）
+ASSUM_TABLE_RE = re.compile(r"^\s*\|[\s:|-]*-{3,}[\s:|-]*\|", re.M)
+
+
+def check_assumptions_readable(body: str) -> list[str]:
+    """W15：「假设与待确认」是业务方唯一会读的一章，按纯文本可读性检查。
+
+    这一章不参与编译，出问题不会翻车，但表格 + 三百字电报体的写法等于没人确认，
+    所以在编译期就点出来。规则见 references/design-doc-spec.md「假设与待确认」。
+    """
+    msgs: list[str] = []
+    if ASSUM_TABLE_RE.search(body):
+        msgs.append("这一章用了表格。设计稿大多在不渲染的编辑器里读，表格会挤成一行看不了。"
+                    "改成「### 需要你确认 / ### 已按这样理解」+ 每条一个小标题的短句写法，"
+                    "写法见 references/design-doc-spec.md")
+        return msgs          # 表格形态下按条切分没有意义，先改形态再看长度
+    for blk in re.split(r"\n\s*\n", body):
+        lines = [ln for ln in blk.split("\n")
+                 if ln.strip() and not ln.lstrip().startswith(("#", ">", "涉及"))]
+        if not lines:
+            continue
+        n = len(re.sub(r"\s", "", "".join(lines)))
+        if n > ASSUM_MAX_CHARS:
+            head = lines[0].strip().strip("*").strip()[:20]
+            msgs.append(f"「{head}…」这一条正文 {n} 字，一条只讲一件事，超过 150 字就拆成两条")
+    return msgs
+
+
 @dataclass
 class Issue:
     level: str   # error / warn
@@ -2607,6 +2635,10 @@ def validate(flow: dict[str, Any], design: Design | None = None) -> list[Issue]:
                 miss = [s for s in ("目标", "参考示例", "应对策略") if s not in nd_.prompt]
                 if miss:
                     add("warn", "W7", nd_.key, "话术缺少段落：" + "、".join(miss))
+        for title, body in design.passthrough:
+            if "假设" in title:
+                for msg in check_assumptions_readable(body):
+                    add("warn", "W15", f"## {title}", msg)
     # 去重
     uniq: list[Issue] = []
     seen_key: set[tuple[str, str, str, str]] = set()

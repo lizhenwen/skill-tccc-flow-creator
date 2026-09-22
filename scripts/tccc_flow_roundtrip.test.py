@@ -417,6 +417,33 @@ hi
 """
 
 
+class AssumptionsReadable(unittest.TestCase):
+    def test_table_form_is_flagged(self):
+        msgs = tf.check_assumptions_readable(
+            "| # | 假设 | 影响范围 | 待确认 |\n|---|---|---|---|\n| 1 | 甲 | N01 | 是 |"
+        )
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("表格", msgs[0])
+
+    def test_long_entry_is_flagged_and_short_one_is_not(self):
+        body = (
+            "### 需要你确认\n\n**Q1 超长条目**\n"
+            + "这条塞了整条链路的分流规则和括号套括号的说明。" * 10
+            + "\n涉及节点：N50 查看仪器底部\n\n**Q2 短条目**\n这一条很短。\n涉及节点：N01 开始通话\n"
+        )
+        msgs = tf.check_assumptions_readable(body)
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("Q1 超长条目", msgs[0])
+
+    def test_well_formed_section_is_clean(self):
+        body = (
+            "> 先看「需要你确认」。\n\n### 需要你确认\n\n**Q1 已签收是用 status=3 判断吗？**\n"
+            "现在这么做：status 等于 3 就当已签收。\n如果搞错了：客户会白等一天。\n"
+            "涉及节点：N04 判断签收状态\n"
+        )
+        self.assertEqual(tf.check_assumptions_readable(body), [])
+
+
 class SplitCanonicalSeq(unittest.TestCase):
     def test_missing_assumptions_keeps_canonical_numbers(self):
         paths = [p for p, _ in tf.split_design(SPLIT_MD)]
