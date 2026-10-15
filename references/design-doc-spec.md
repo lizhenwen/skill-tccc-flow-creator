@@ -97,7 +97,7 @@
 | 合规录音 | enableComplianceAudio | 是/否 |
 | 外接音色配置 | customTTSConfig | |
 | 兜底固定话术 | fallbackFixMessage | |
-| 语言 | languages | 逗号分隔 |
+| 语言 | languages | 只能一个，写保存用的短 key。国内站、美国站写 `zh`；国际站还可写 `zh-en` / `zh-yue` / `en` / `id` / `ja` / `esp` / `ms` / `ar` / `pt`。`zh-en`、`zh-yue` 原样保留，其余取 `-` 前一段 |
 | 技能组ID | —— | 供 `[transfer-skill]` 节点缺省取值 |
 | 转接智能体ID | —— | 供 `[transfer-agent]` 节点缺省取值 |
 | 环境注入变量 | —— | 逗号分隔。**不在这里声明的未定义变量会报 E11** |

@@ -72,7 +72,7 @@
 | customTTSConfig | "" | 仅外接音色模式必填 |
 | fallbackFixMessage | "" | `replyMode=fixed` 时必填 |
 | enableComplianceAudio / transferFunctionEnable / endFunctionEnable | true | |
-| languages | ["zh-CN"] | |
+| languages | ["zh"] | 数组只放一项。中文是 `zh`。`zh-en`、`zh-yue` 原样保留，其余取 `-` 前一段 |
 | executionMode | sequentialMode | |
 | ambientSoundType / ambientSoundVolume | none / 1 | 背景音（如 busy_office） |
 | voicemailMessage / voicemailAction / enableVoicemailDetection | …/0/false | |
